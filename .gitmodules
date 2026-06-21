@@ -1,7 +1,3 @@
-[submodule "VScodeConfig@Flutter"]
-	path = VScodeConfig@Flutter
-	url = https://github.com/JobsKits/VScodeConfigByFlutter.git
-	branch = main
 [submodule "🐦VScodeConfigByFlutter"]
 	path = 🐦VScodeConfigByFlutter
 	url = https://github.com/JobsKits/VScodeConfigByFlutter.git
