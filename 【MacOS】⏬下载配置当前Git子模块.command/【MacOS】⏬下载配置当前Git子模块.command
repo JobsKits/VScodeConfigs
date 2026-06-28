@@ -1599,19 +1599,16 @@ main_menu_loop() {
     esac
   done
 }
-# 展示同目录 README，并等待用户确认后执行。
-show_readme_and_wait() {
+# 展示脚本内置自述，并等待用户确认后执行。
+show_script_intro_and_wait() {
   print -r -- '============================== 脚本内置自述 =============================='
   print -r -- '脚本名称：【MacOS】⏬下载配置当前Git子模块.command'
   print -r -- '核心用途：执行“⏬下载配置当前Git子模块”对应的 Git 自动化操作。'
   print -r -- '影响范围：可能修改当前仓库、工作区、分支或 Git 索引。'
   print -r -- '取消方式：确认前按 Ctrl+C 终止，不会继续执行后续业务。'
   print -r -- '============================================================================'
-  local readme_path="${SCRIPT_DIR}/README.md"
-  [[ -f "$readme_path" ]] || { error_echo "未找到配套 README.md：$readme_path"; return 1; }
-  cat "$readme_path" | tee -a "$LOG_FILE"
   echo ""
-  read -r "?👉 已阅读 README，按回车继续；按 Ctrl+C 取消：" _
+  read -r "?👉 已了解脚本用途与影响，按回车继续；按 Ctrl+C 取消：" _
 }
 # 编排脚本的高层业务流程。
 # 初始化本次运行的日志文件。
@@ -1637,7 +1634,7 @@ initialize_script_runtime() {
 # 编排脚本的高层业务流程。
 main() {
   # 展示配套 README，确认子模块同步范围后继续。
-  show_readme_and_wait
+  show_script_intro_and_wait
   # 初始化 Shell 选项、日志、依赖和入口运行状态。
   initialize_script_runtime
   # 清空当前脚本旧日志，确保本次记录独立可查。
