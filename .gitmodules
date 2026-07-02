@@ -1,3 +1,4 @@
+# 记录本仓库子模块的路径、远端地址和默认分支。
 [submodule "🐦VScodeConfigByFlutter"]
 	path = 🐦VScodeConfigByFlutter
 	url = https://github.com/JobsKits/VScodeConfigByFlutter.git
