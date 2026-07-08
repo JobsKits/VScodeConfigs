@@ -483,13 +483,22 @@ ensure_fzf_healthy() {
 }
 # ============================== 父仓协议与基础操作 ==============================
 ensure_repo_initialized() {
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    info_echo "已位于 Git 仓库内"
-  else
-    run_cmd git init
-    success_echo "已初始化父 Git 仓库"
+  local git_root=""
+  local current_root=""
+
+  current_root="$(pwd -P)"
+  if ! git_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    error_echo "当前目录不是父 Git 仓库：$current_root"
+    return 1
   fi
 
+  git_root="$(cd "$git_root" && pwd -P)"
+  if [[ "$git_root" != "$current_root" ]]; then
+    error_echo "脚本必须在父 Git 根目录运行：$current_root；当前 Git 根目录：$git_root"
+    return 1
+  fi
+
+  info_echo "已位于父 Git 仓库根目录：$current_root"
   run_cmd git config core.quotepath false || true
   git -c core.quotepath=false status >/dev/null
 }
@@ -881,17 +890,6 @@ unique_paths_from_stdin() {
     printf '%s\n' "$p"
   done
 }
-# 解析并返回 collect existing child git dirs 所需信息。
-collect_existing_child_git_dirs() {
-  local d=""
-  for d in ./*(N/); do
-    d="${d#./}"
-    [[ -z "$d" || "$d" == ".git" ]] && continue
-    if is_git_worktree "$d"; then
-      printf '%s\n' "$d"
-    fi
-  done
-}
 # 解析并返回 collect full delete targets 所需信息。
 collect_full_delete_targets() {
   {
@@ -900,8 +898,6 @@ collect_full_delete_targets() {
       printf '%s\n' "$p"
       repo_name_by_path "$p" 2>/dev/null || true
     done
-
-    collect_existing_child_git_dirs
   } | unique_paths_from_stdin
 }
 # 清理 remove worktree dir safely 对应的目标内容。
@@ -1134,7 +1130,7 @@ stage_and_commit_parent_changes() {
 }
 # ============================== 三种菜单动作 ==============================
 full_sync_to_latest() {
-  info_echo "开始全量同步：先对 .gitmodules 做一次查漏补缺；再删除目标子 Git 工作目录/目标空目录；最后按 SUBMODULE_REPO_URLS 重建"
+  info_echo "开始全量同步：先对 .gitmodules 做一次查漏补缺；再删除 SUBMODULE_REPO_URLS 配置的目标目录；最后按配置重建"
 
   reconcile_gitmodules_with_config_once
 
