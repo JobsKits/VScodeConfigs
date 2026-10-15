@@ -37,6 +37,8 @@
 
 在 Finder 中打开当前目录并双击 `【MacOS】⏬下载配置当前Git子模块.command`。阅读终端自述后按回车继续，按 `Ctrl+C` 取消。
 
+进入“选择指定子模块同步（可多选）”后，用 ↑ / ↓ 移动，按回车（Enter）勾选或取消项目；最后按 **空格键（Space）确认并开始同步**，无需再按回车。列表底部会持续显示操作提示；按 ← 返回上一页。
+
 ### 4.2、终端运行 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
 ```shell
