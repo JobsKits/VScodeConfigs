@@ -88,4 +88,6 @@ $TMPDIR/【MacOS】⏬下载配置当前Git子模块.log
 
 README 只描述脚本职责和通用风险，不代表已经在当前 MacOS 环境执行真实业务命令。交付前应至少通过对应 Shell 的静态语法检查。
 
+[**Homebrew**](https://brew.sh/) 安装路径由用户选择：已有可运行安装时复用；确实需要安装时先强提示，只有精确输入大写 `YES` 才选择系统标准目录，其它输入或直接回车选择当前用户的 `.local/homebrew`。`YES` 只表示选择路径，权限与密码由官方安装器实际处理；有管理员权限也可以选用户目录。选定路径失败立即停止，不自动切换；`Ctrl+C` / 输入结束取消整个任务。
+
 <a id="🔚" href="#前言" style="font-size:17px; color:green; font-weight:bold;">我是有底线的➤点我回到首页</a>
