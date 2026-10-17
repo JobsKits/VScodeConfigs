@@ -1,6 +1,7 @@
 #!/bin/zsh
 # 脚本自述：
 # - 脚本名称：【MacOS】⏬下载配置当前Git子模块.command
+# - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS，递归子模块继承，不写全局配置。
 # - 核心用途：执行“⏬下载配置当前Git子模块”对应的 Git / Sourcetree 自动化操作。
 # - 影响范围：可能修改当前仓库、工作区、分支、菜单配置或 Git 索引。
 # - 运行提示：运行后会先打印内置自述；终端模式按回车确认后继续，按 Ctrl+C 可取消。
@@ -423,9 +424,44 @@ resolve_relative_git_url() {
   (( ${#resolved[@]} > 0 )) || return 1
   printf '%s%s\n' "$prefix" "${(j:/:)resolved}"
 }
-# 仅在用户显式指定协议时转换；端口不能跨协议推测。
+# Gitee 标准 SSH 地址使用已确认的 HTTPS 入口，不改仓名或推断自定义端口。
+normalize_gitee_https_url() {
+  local url="$1"
+  case "$url" in
+    git@gitee.com:*) printf 'https://gitee.com/%s\n' "${url#git@gitee.com:}" ;;
+    ssh://git@gitee.com/*) printf 'https://gitee.com/%s\n' "${url#ssh://git@gitee.com/}" ;;
+    ssh://git@gitee.com:22/*) printf 'https://gitee.com/%s\n' "${url#ssh://git@gitee.com:22/}" ;;
+    *) printf '%s\n' "$url" ;;
+  esac
+}
+# 追加本次进程的 Git 规则，让首次递归克隆也走 HTTPS，不写全局配置。
+configure_gitee_https_transport() {
+  [[ "${JOBS_GITEE_HTTPS_CONFIGURED:-0}" != 1 ]] || return 0
+  local config_count="${GIT_CONFIG_COUNT:-0}" prefix=""
+  if [[ "$config_count" != <-> || ${#config_count} -gt 9 ]]; then
+    error_echo "GIT_CONFIG_COUNT 无效或过大，未修改 Git 下载环境。"
+    return 1
+  fi
+  local -i config_index=$(( 10#$config_count ))
+  local -a ssh_prefixes
+  ssh_prefixes=('git@gitee.com:' 'ssh://git@gitee.com/' 'ssh://git@gitee.com:22/')
+  for prefix in "${ssh_prefixes[@]}"; do
+    typeset -gx "GIT_CONFIG_KEY_${config_index}=url.https://gitee.com/.insteadOf"
+    typeset -gx "GIT_CONFIG_VALUE_${config_index}=$prefix"
+    (( config_index += 1 ))
+  done
+  export GIT_CONFIG_COUNT="$config_index"
+  typeset -g JOBS_GITEE_HTTPS_CONFIGURED=1
+  info_echo "Gitee 标准 SSH 地址在本次进程改走 HTTPS，首次克隆和递归子模块均继承。"
+}
+# 仅在用户显式指定协议时转换；Gitee 标准地址固定 HTTPS，自定义端口保持边界。
 git_url_with_style() {
   local url="$1" style="${GIT_URL_STYLE:-auto}" parsed="" prefix="" rest="" host="" repo_path=""
+  url="$(normalize_gitee_https_url "$url")"
+  if [[ "$url" == https://gitee.com/* ]]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
   [[ "$style" == auto ]] && { printf '%s\n' "$url"; return 0; }
   parsed="$(parse_git_remote_url "$url")" || return 1
   prefix="${parsed%%|*}"
@@ -1254,7 +1290,7 @@ remove_worktree_dir_safely() {
 
   if [[ -e "$submodule_path" ]]; then
     if is_git_worktree "$submodule_path" || is_dir_empty "$submodule_path" || [[ "$FORCE_DELETE" == "1" ]]; then
-      run_cmd rm -rf "$submodule_path"
+      run_cmd rm -rf "$submodule_path" || return 1
       warn_echo "已删除目标目录：$submodule_path"
     else
       error_echo "发现非 Git 且非空目录，默认拒绝删除：$submodule_path；确认要删可设置 FORCE_DELETE=1"
@@ -1285,10 +1321,10 @@ clone_submodule_worktree() {
   fi
 
   if remote_branch_exists "$url" "$branch"; then
-    run_cmd git clone "${clone_args[@]}" --branch "$branch" --recurse-submodules --jobs="$(get_ncpu)" "$url" "$submodule_path"
+    run_cmd git clone "${clone_args[@]}" --branch "$branch" --recurse-submodules --jobs="$(get_ncpu)" "$url" "$submodule_path" || return 1
   else
     warn_echo "远端未确认存在分支 $branch，将按远端默认分支 clone：$submodule_path"
-    run_cmd git clone "${clone_args[@]}" --recurse-submodules --jobs="$(get_ncpu)" "$url" "$submodule_path"
+    run_cmd git clone "${clone_args[@]}" --recurse-submodules --jobs="$(get_ncpu)" "$url" "$submodule_path" || return 1
   fi
 
   run_cmd git -C "$submodule_path" config core.quotepath false || true
@@ -1306,7 +1342,7 @@ ensure_submodule_worktree_present() {
     if is_git_worktree "$submodule_path"; then
       assert_clean_submodule "$submodule_path" "纳入子模块" || return 1
     elif is_dir_empty "$submodule_path"; then
-      run_cmd rm -rf "$submodule_path"
+      run_cmd rm -rf "$submodule_path" || return 1
     else
       error_echo "目标目录已存在且不是 Git 空目录，拒绝覆盖：$submodule_path"
       return 1
@@ -1314,16 +1350,16 @@ ensure_submodule_worktree_present() {
   fi
 
   if [[ ! -e "$submodule_path" ]]; then
-    clone_submodule_worktree "$submodule_path"
+    clone_submodule_worktree "$submodule_path" || return 1
   fi
 
   # 不使用 git submodule add，避免 .gitmodules 被 Git 自动重写；手动 add 会把内部 Git 仓登记为 gitlink。
-  run_cmd git add -- .gitmodules "$submodule_path"
+  run_cmd git add -- .gitmodules "$submodule_path" || return 1
 
   # 标准子模块形态：子仓目录里保留 .git 单文件，真正 Git 数据放到父仓 .git/modules 下。
   # 这一步不决定是否浅克隆；浅克隆由 --depth 控制。这里负责把 .git 文件夹吸收到父仓管理。
   run_cmd git submodule absorbgitdirs -- "$submodule_path" >/dev/null 2>&1 || true
-  run_cmd git add -- .gitmodules "$submodule_path"
+  run_cmd git add -- .gitmodules "$submodule_path" || return 1
 
   if [[ -f "$submodule_path/.git" ]]; then
     success_echo "已登记标准子模块 gitlink：$submodule_path（子仓 .git 为单文件）"
@@ -1369,7 +1405,7 @@ sync_one_submodule_to_latest() {
   assert_clean_submodule "$submodule_path" "更新" || return 1
 
   run_cmd git -C "$submodule_path" config core.quotepath false || true
-  run_cmd git -C "$submodule_path" remote set-url origin "$url"
+  run_cmd git -C "$submodule_path" remote set-url origin "$url" || return 1
   if [[ "$SUBMODULE_FETCH_TAGS" != "1" ]]; then
     run_cmd git -C "$submodule_path" config remote.origin.tagOpt --no-tags || true
   fi
@@ -1391,10 +1427,10 @@ sync_one_submodule_to_latest() {
     fetch_args+=(--no-tags)
   fi
 
-  run_cmd git -C "$submodule_path" fetch "${fetch_args[@]}" origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" --prune
-  run_cmd git -C "$submodule_path" -c core.quotepath=false checkout -B "$branch" "origin/$branch"
+  run_cmd git -C "$submodule_path" fetch "${fetch_args[@]}" origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" --prune || return 1
+  run_cmd git -C "$submodule_path" -c core.quotepath=false checkout -B "$branch" "origin/$branch" || return 1
   run_cmd git -C "$submodule_path" branch --set-upstream-to="origin/$branch" "$branch" >/dev/null 2>&1 || true
-  run_cmd git -C "$submodule_path" reset --hard "origin/$branch"
+  run_cmd git -C "$submodule_path" reset --hard "origin/$branch" || return 1
 
   sync_submodule_urls_at_repo "$PWD/$submodule_path" "$url" || return 1
 
@@ -1403,7 +1439,10 @@ sync_one_submodule_to_latest() {
   if [[ "$SUBMODULE_SHALLOW_CLONE" == "1" ]]; then
     submodule_update_args+=(--depth "$SUBMODULE_DEPTH" --recommend-shallow)
   fi
-  run_cmd git -C "$submodule_path" "${submodule_update_args[@]}" || true
+  if ! run_cmd git -C "$submodule_path" "${submodule_update_args[@]}"; then
+    error_echo "递归子模块同步失败：$submodule_path；未标记为同步成功。"
+    return 1
+  fi
 
   # 再次确保子仓是标准 submodule 形态：工作目录下 .git 为单文件，Git 数据由父仓 .git/modules 托管。
   run_cmd git submodule absorbgitdirs -- "$submodule_path" >/dev/null 2>&1 || true
@@ -1422,8 +1461,8 @@ sync_selected_submodules_to_latest() {
   fi
 
   for p in "${paths[@]}"; do
-    ensure_submodule_worktree_present "$p"
-    sync_one_submodule_to_latest "$p"
+    ensure_submodule_worktree_present "$p" || return 1
+    sync_one_submodule_to_latest "$p" || return 1
   done
 }
 # 封装 stage and commit parent changes 对应的独立处理逻辑。
@@ -1485,7 +1524,7 @@ full_sync_to_latest() {
     synced_paths+=("$p")
   done
 
-  sync_selected_submodules_to_latest "${synced_paths[@]}"
+  sync_selected_submodules_to_latest "${synced_paths[@]}" || return 1
   sync_submodule_urls_for_remote || return 1
   stage_and_commit_parent_changes "${synced_paths[@]}"
   parent_push_if_needed
@@ -1518,7 +1557,7 @@ update_existing_to_latest() {
 
   reconcile_gitmodules_with_config_once
   info_echo "只同步当前已有的子 Git 目录：${existing_paths[*]}"
-  sync_selected_submodules_to_latest "${existing_paths[@]}"
+  sync_selected_submodules_to_latest "${existing_paths[@]}" || return 1
   sync_submodule_urls_for_remote || return 1
   stage_and_commit_parent_changes "${existing_paths[@]}"
   parent_push_if_needed
@@ -1580,7 +1619,7 @@ add_new_git_url_interactive() {
     append_runtime_submodule "$page_url" "$https_url" "$ssh_url" "$repo_name" "$local_path"
     ensure_gitmodules_entry "$local_path" "$input" || continue
     GITMODULES_RECONCILED=1
-    sync_selected_submodules_to_latest "$local_path"
+    sync_selected_submodules_to_latest "$local_path" || return 1
     sync_submodule_urls_for_remote || return 1
     stage_and_commit_parent_changes "$local_path"
     parent_push_if_needed
@@ -1611,7 +1650,7 @@ build_submodule_picker_content() {
   - 第一项“全选”会一次勾选 / 取消全部 SUBMODULE_REPO_URLS 项目
   - 按 ← 返回上一页
 
-子模块同步 URL 模式: $style（auto 保留绝对地址；相对地址继承 $REMOTE_NAME）
+子模块同步 URL 模式: $style（相对地址继承 $REMOTE_NAME；Gitee 标准地址固定 HTTPS）
 子模块分支优先级: $SUBMODULE_BRANCH
 子仓浅克隆: $SUBMODULE_SHALLOW_CLONE
 浅克隆深度: $SUBMODULE_DEPTH
@@ -1787,7 +1826,7 @@ select_configured_submodules_interactive() {
         command clear 2>/dev/null || printf '\033[2J\033[H'
         reconcile_gitmodules_with_config_once
         info_echo "开始同步已选择的子模块：${selected_paths[*]}"
-        sync_selected_submodules_to_latest "${selected_paths[@]}"
+        sync_selected_submodules_to_latest "${selected_paths[@]}" || return 1
         sync_submodule_urls_for_remote || return 1
         stage_and_commit_parent_changes "${selected_paths[@]}"
         parent_push_if_needed
@@ -1845,7 +1884,7 @@ build_intro_content() {
 当前目录: $(pwd)
 父仓远端: $REMOTE_NAME
 子模块分支优先级: $SUBMODULE_BRANCH
-子模块同步 URL 模式: $style（auto 保留绝对地址；相对地址继承 $REMOTE_NAME）
+子模块同步 URL 模式: $style（相对地址继承 $REMOTE_NAME；Gitee 标准地址固定 HTTPS）
 .gitmodules 补缺 URL 模式: $gm_style
 干跑: $DRY_RUN
 自动提交父仓: $AUTO_PARENT_COMMIT
@@ -1979,6 +2018,7 @@ main() {
   # 确认当前目录已经初始化为 Git 仓库。
   ensure_repo_initialized
   # 检查并修复父仓库远程地址配置。
+  configure_gitee_https_transport || return 1 # 在首次父仓联网与递归克隆前注入进程规则。
   ensure_git_remote "$REMOTE_NAME"
   # 确保父仓库处于可同步的目标分支。
   ensure_parent_branch
