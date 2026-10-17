@@ -216,25 +216,12 @@ export LANG="${LANG:-zh_CN.UTF-8}"
 export LC_CTYPE="${LC_CTYPE:-UTF-8}"
 
 # ============================== 用户只需要改这里：目标子 Git 列表 ==============================
-# 只允许写“浏览器页面地址”，不要写 .git，也不要写 SSH 地址。
-#
-# ✅ 正确：
-#   "https://github.com/JobsKits/xxx"
-#
-# ❌ 不要写：
-#   "https://github.com/JobsKits/xxx.git"
-#   "git@github.com:JobsKits/xxx.git"
-#
-# 脚本会自动把页面地址转成两种固定下载地址：
-#   HTTPS clone: https://github.com/JobsKits/xxx.git
-#   SSH clone:   git@github.com:JobsKits/xxx.git
-#
-# 默认行为：
-#   只写页面 URL              -> 本地目录自动使用仓库名，例如 JobsOCBaseConfigDemo
-#   写成 页面 URL|本地目录     -> 使用自定义本地目录，例如 🔽JobsSoftware.MacOS
-#
-# 新增子仓：往 SUBMODULE_REPO_URLS 里加一行浏览器页面地址。
-# 删除子仓：从 SUBMODULE_REPO_URLS 里删掉对应页面地址；默认只查漏补缺，不删除 .gitmodules 旧配置。
+# 支持任意托管站点的 HTTPS、git@host:namespace/repo.git、ssh://git@host:端口/namespace/repo.git。
+# 使用 地址|本地目录 指定本地名称；未指定时使用真实地址中的仓库名。
+# 已有 .gitmodules 的 URL、分支和扩展字段优先保留；相对 URL 随 REMOTE_NAME 的平台、namespace 和协议解析。
+# 新条目依据所选父 remote 与真实子 remote 生成 ../仓名.git；跨平台映射无法确认时停止，须在 .gitmodules 明确地址。
+# 跨组织或不同仓名可在 .gitmodules 填写完整地址，不会把 GitHub 主机/owner 机械替换。
+# 删除清单项目默认不会删除 .gitmodules 旧配置。
 SUBMODULE_REPO_URLS=(
   "https://github.com/JobsKits/VScodeConfigByFlutter|🐦VScodeConfigByFlutter"
   # 以后新增仓库，只写浏览器页面地址即可。
@@ -248,7 +235,7 @@ DRY_RUN="${DRY_RUN:-0}"                                # 1=只打印动作，不
 FORCE_DELETE="${FORCE_DELETE:-0}"                      # 1=允许删除非 Git 且非空的冲突目录；默认拒绝，避免误删
 AUTO_PARENT_COMMIT="${AUTO_PARENT_COMMIT:-1}"          # 1=自动提交 .gitmodules/gitlink 变化
 AUTO_PARENT_PUSH="${AUTO_PARENT_PUSH:-0}"              # 1=自动推送父仓；默认不推送，避免跨机器误推
-GIT_URL_STYLE="${GIT_URL_STYLE:-auto}"                  # auto/https/ssh；默认自动继承父仓 origin 协议
+GIT_URL_STYLE="${GIT_URL_STYLE:-auto}"                  # auto/https/ssh；默认继承所选父 remote 的完整地址
 PRUNE_STALE_GITMODULES="${PRUNE_STALE_GITMODULES:-0}"  # 1=删除 .gitmodules 中已经不在 SUBMODULE_REPO_URLS 的旧子模块；默认只查漏补缺
 SUBMODULE_SHALLOW_CLONE="${SUBMODULE_SHALLOW_CLONE:-1}"    # 1=子仓浅克隆，只拿最新必要历史；0=完整克隆
 SUBMODULE_DEPTH="${SUBMODULE_DEPTH:-1}"                    # 浅克隆深度；默认 1，只锚定最新一层提交
@@ -333,38 +320,152 @@ contains_item() {
   return 1
 }
 # ============================== Git URL 解析 ==============================
-# 输出：page_url|https_clone_url|ssh_clone_url|repo_name
-normalize_git_url() {
-  local raw=""
-  raw="$(trim_string "$1")"
+# 解析任意托管站点地址，保留协议、SSH 用户/端口和完整 namespace。
+parse_git_remote_url() {
+  local raw="$(trim_string "$1")" prefix="" repo_path="" authority="" repo="" namespace=""
   raw="${raw%/}"
-
-  local rest=""
-  local owner=""
-  local repo=""
-
-  if [[ "$raw" == https://github.com/* ]]; then
-    rest="${raw#https://github.com/}"
-    rest="${rest%.git}"
-  elif [[ "$raw" == git@github.com:* ]]; then
-    rest="${raw#git@github.com:}"
-    rest="${rest%.git}"
-  else
+  [[ -n "$raw" && "$raw" != *[[:space:]]* && "$raw" != *[\|\?\#]* ]] || return 1
+  case "$raw" in
+    https://*|http://*|ssh://*|git://*)
+      authority="${raw#*://}"
+      [[ "$authority" == */* ]] || return 1
+      repo_path="${authority#*/}"
+      authority="${authority%%/*}"
+      [[ -n "$authority" ]] || return 1
+      case "$raw" in
+        http://*|https://*) [[ "$authority" != *@* ]] || return 1 ;;
+        ssh://*) [[ "${authority%%@*}" != *:* || "$authority" != *@* ]] || return 1 ;;
+      esac
+      prefix="${raw%%://*}://$authority/"
+      ;;
+    *@*:*)
+      prefix="${raw%%:*}:"
+      repo_path="${raw#*:}"
+      [[ "$prefix" != */* && "$prefix" == *@*: ]] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  repo_path="${repo_path%.git}"
+  [[ -n "$repo_path" && "$repo_path" != /* && "$repo_path" != */ && "$repo_path" != *//* ]] || return 1
+  local component=""
+  for component in "${(@s:/:)repo_path}"; do
+    [[ "$component" != . && "$component" != .. && -n "$component" ]] || return 1
+  done
+  repo="${repo_path##*/}"
+  namespace=""
+  [[ "$repo_path" != */* ]] || namespace="${repo_path%/*}"
+  [[ -n "$repo" ]] || return 1
+  printf '%s|%s|%s\n' "$prefix" "$namespace" "$repo"
+}
+# 返回可对照真实 remote 的主机与 namespace，不推测跨平台 owner 映射。
+git_remote_scope() {
+  local parsed=""
+  parsed="$(parse_git_remote_url "$1")" || return 1
+  local prefix="${parsed%%|*}" rest="${parsed#*|}" host=""
+  host="${prefix#*://}"
+  host="${host%/}"
+  host="${host%:}"
+  host="${host##*@}"
+  printf '%s|%s\n' "${(L)host}" "${rest%%|*}"
+}
+# 输出展示及常用协议地址；实际下载仍保留配置原地址和端口。
+normalize_git_url() {
+  local parsed=""
+  parsed="$(parse_git_remote_url "$1")" || return 1
+  local prefix="${parsed%%|*}" rest="${parsed#*|}" namespace="" repo="" host="" https_url="" ssh_url=""
+  namespace="${rest%%|*}"
+  repo="${rest#*|}"
+  host="${prefix#*://}"
+  host="${host%/}"
+  host="${host%:}"
+  host="${host##*@}"
+  https_url="https://$host/${namespace:+$namespace/}$repo.git"
+  ssh_url="git@$host:${namespace:+$namespace/}$repo.git"
+  local page_url=""
+  case "$prefix" in
+    http://*|https://*)
+      https_url="$prefix${namespace:+$namespace/}$repo.git"
+      [[ "$host" != *:* ]] || ssh_url=""
+      page_url="${https_url%.git}"
+      ;;
+    *)
+      ssh_url="$prefix${namespace:+$namespace/}$repo.git"
+      [[ "$host" != *:* ]] || https_url=""
+      page_url="${https_url%.git}"
+      [[ -n "$page_url" ]] || page_url="${ssh_url%.git}"
+      ;;
+  esac
+  printf '%s|%s|%s|%s\n' "$page_url" "$https_url" "$ssh_url" "$repo"
+}
+# 按 Git 的仓库目录语义解析 ./ 与 ../，保留父 remote 的完整连接信息。
+resolve_relative_git_url() {
+  local parent_url="$1" relative_url="$2" parsed="" prefix="" rest="" component=""
+  [[ "$relative_url" == ./* || "$relative_url" == ../* ]] || return 1
+  [[ "$relative_url" != *[[:space:]\|\?\#]* ]] || return 1
+  parsed="$(parse_git_remote_url "$parent_url")" || return 1
+  prefix="${parsed%%|*}"
+  rest="${parsed#*|}"
+  local -a components resolved
+  local parent_repo="${rest#*|}"
+  [[ "${parent_url%/}" != *.git ]] || parent_repo+=".git"
+  components=("${(@s:/:)${rest%%|*}}" "$parent_repo" "${(@s:/:)relative_url}")
+  resolved=()
+  for component in "${components[@]}"; do
+    case "$component" in
+      ''|.) ;;
+      ..)
+        (( ${#resolved[@]} > 0 )) || return 1
+        resolved[-1]=()
+        ;;
+      *) resolved+=("$component") ;;
+    esac
+  done
+  (( ${#resolved[@]} > 0 )) || return 1
+  printf '%s%s\n' "$prefix" "${(j:/:)resolved}"
+}
+# 仅在用户显式指定协议时转换；端口不能跨协议推测。
+git_url_with_style() {
+  local url="$1" style="${GIT_URL_STYLE:-auto}" parsed="" prefix="" rest="" host="" repo_path=""
+  [[ "$style" == auto ]] && { printf '%s\n' "$url"; return 0; }
+  parsed="$(parse_git_remote_url "$url")" || return 1
+  prefix="${parsed%%|*}"
+  rest="${parsed#*|}"
+  case "$style:$prefix" in
+    https:http://*|https:https://*|ssh:ssh://*|ssh:*@*:)
+      printf '%s\n' "$url"
+      return 0
+      ;;
+  esac
+  host="${prefix#*://}"
+  host="${host%/}"
+  host="${host%:}"
+  host="${host##*@}"
+  if [[ "$host" == *:* ]]; then
+    error_echo "无法推测跨协议端口，请使用 GIT_URL_STYLE=auto 或为子模块配置完整目标地址：$url"
     return 1
   fi
-
-  owner="${rest%%/*}"
-  repo="${rest#*/}"
-
-  if [[ -z "$owner" || -z "$repo" || "$owner" == "$repo" || "$repo" == */* || "$owner" == *[[:space:]]* || "$repo" == *[[:space:]]* ]]; then
-    return 1
-  fi
-
-  printf 'https://github.com/%s/%s|https://github.com/%s/%s.git|git@github.com:%s/%s.git|%s\n' \
-    "$owner" "$repo" \
-    "$owner" "$repo" \
-    "$owner" "$repo" \
-    "$repo"
+  case "$style" in
+    https) repo_path="${rest%%|*}"; printf 'https://%s/%s%s.git\n' "$host" "${repo_path:+$repo_path/}" "${rest#*|}" ;;
+    ssh) repo_path="${rest%%|*}"; printf 'git@%s:%s%s.git\n' "$host" "${repo_path:+$repo_path/}" "${rest#*|}" ;;
+    *) error_echo "GIT_URL_STYLE 只支持 auto/https/ssh：$style"; return 1 ;;
+  esac
+}
+# 从清单提取原始地址，避免 SSH 自定义端口被展示用地址替代。
+configured_git_url_by_path() {
+  local target="$1" spec="" raw="" local_path="" parsed=""
+  for spec in "${SUBMODULE_REPO_URLS[@]}"; do
+    raw="$(trim_string "${spec%%|*}")"
+    if [[ "$spec" == *'|'* ]]; then
+      local_path="$(trim_string "${spec#*|}")"
+    else
+      parsed="$(parse_git_remote_url "$raw")" || continue
+      local_path="${parsed##*|}"
+    fi
+    [[ "$local_path" == "$target" ]] || continue
+    printf '%s\n' "$raw"
+    return 0
+  done
+  repo_https_by_path "$target"
 }
 # 封装 entry path 对应的独立处理逻辑。
 entry_path() {
@@ -469,14 +570,9 @@ load_configured_submodules() {
     url_part="$(trim_string "$url_part")"
     local_path="$(trim_string "$local_path")"
 
-    if [[ "$url_part" == *.git || "$url_part" == git@github.com:* ]]; then
-      error_echo "SUBMODULE_REPO_URLS 只能写浏览器页面地址，当前非法：$url_part"
-      exit 1
-    fi
-
     local normalized=""
     if ! normalized="$(normalize_git_url "$url_part")"; then
-      error_echo "SUBMODULE_REPO_URLS 存在无法识别的 GitHub 页面地址：$url_part"
+      error_echo "SUBMODULE_REPO_URLS 存在无法识别的 Git 仓库地址：$url_part"
       exit 1
     fi
 
@@ -713,16 +809,65 @@ detect_git_url_style() {
   esac
 }
 # 封装 clone url for path 对应的独立处理逻辑。
+# 相对 URL 完整跟随所选父 remote，明确绝对 URL 保留其平台和 namespace。
 clone_url_for_path() {
-  local submodule_path="$1"
-  local style=""
-  style="$(detect_git_url_style)"
-
-  if [[ "$style" == "ssh" ]]; then
-    repo_ssh_by_path "$submodule_path"
-  else
-    repo_https_by_path "$submodule_path"
+  local submodule_path="$1" url="" parent_url=""
+  url="$(gitmodules_url_for_path "$submodule_path")" || return 1
+  if [[ "$url" == ./* || "$url" == ../* ]]; then
+    parent_url="$(git remote get-url "$REMOTE_NAME" 2>/dev/null)" || return 1
+    url="$(resolve_relative_git_url "$parent_url" "$url")" || {
+      error_echo "无法相对父远端解析子模块地址：$submodule_path -> $url"
+      return 1
+    }
   fi
+  git_url_with_style "$url"
+}
+# 逐层同步已初始化子仓的真实地址，避免命令行覆盖被递归继承。
+# 拒绝越界路径和指向仓外的符号链接，再确认已有子仓的独立根目录。
+validate_submodule_url_path() {
+  local repo_root="$1" submodule_path="$2" component="" child_root="" child_git_root=""
+  [[ -n "$submodule_path" && "$submodule_path" != /* && "$submodule_path" != *$'\n'* && "$submodule_path" != *$'\r'* ]] || return 1
+  for component in "${(@s:/:)submodule_path}"; do
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+  done
+  repo_root="${repo_root:A}"
+  child_root="$repo_root/$submodule_path"
+  child_root="${child_root:A}"
+  [[ "$child_root" == "$repo_root"/* ]] || return 1
+  if [[ -e "$child_root/.git" ]]; then
+    child_git_root="$(git -C "$child_root" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    [[ "${child_git_root:A}" == "$child_root" ]] || return 1
+  fi
+}
+sync_submodule_urls_at_repo() {
+  local repo_root="$1" parent_url="$2" key="" section="" submodule_path="" url="" child_root=""
+  [[ -f "$repo_root/.gitmodules" ]] || return 0
+  while IFS= read -r key; do
+    section="${key#submodule.}"
+    section="${section%.path}"
+    submodule_path="$(git config -f "$repo_root/.gitmodules" --get "$key")" || return 1
+    validate_submodule_url_path "$repo_root" "$submodule_path" || {
+      error_echo "拒绝同步仓外或非独立子仓路径：$submodule_path"
+      return 1
+    }
+    child_root="$repo_root/$submodule_path"
+    url="$(git config -f "$repo_root/.gitmodules" --get "submodule.$section.url")" || return 1
+    if [[ "$url" == ./* || "$url" == ../* ]]; then
+      url="$(resolve_relative_git_url "$parent_url" "$url")" || return 1
+    fi
+    url="$(git_url_with_style "$url")" || return 1
+    run_cmd git -C "$repo_root" config "submodule.$section.url" "$url" || return 1
+    [[ -e "$child_root/.git" ]] || continue
+    run_cmd git -C "$child_root" remote set-url origin "$url" || return 1
+    sync_submodule_urls_at_repo "$child_root" "$url" || return 1
+  done < <(git config -f "$repo_root/.gitmodules" --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null || true)
+}
+# 从显式选择的父 remote 开始，各层只使用自身解析后的地址。
+sync_submodule_urls_for_remote() {
+  local parent_url="" repo_root=""
+  parent_url="$(git remote get-url "$REMOTE_NAME" 2>/dev/null)" || return 1
+  repo_root="$(git rev-parse --show-toplevel)" || return 1
+  sync_submodule_urls_at_repo "$repo_root" "$parent_url"
 }
 # 封装 parent has uncommitted changes 对应的独立处理逻辑。
 parent_has_uncommitted_changes() {
@@ -887,48 +1032,77 @@ collect_gitmodules_paths() {
   done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null || true)
 }
 # 封装 gitmodules preferred style 对应的独立处理逻辑。
-gitmodules_preferred_style() {
-  if [[ -f .gitmodules ]]; then
-    local key=""
-    while IFS= read -r key; do
-      local url=""
-      url="$(git config -f .gitmodules --get "$key" 2>/dev/null || true)"
-      case "$url" in
-        git@*|ssh://*) printf '%s\n' "ssh"; return 0 ;;
-        http://*|https://*) printf '%s\n' "https"; return 0 ;;
-      esac
-    done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.url$' 2>/dev/null || true)
-  fi
-
-  # .gitmodules 作为跨机器配置文件，默认保持 HTTPS；实际下载/同步仍按父仓 origin 自动改用 HTTPS/SSH。
-  printf '%s\n' "https"
-}
 # 封装 gitmodules url for path 对应的独立处理逻辑。
+# 已知镜像仓名不同时保留明确绝对地址，不把当前平台仓名传播到其它平台。
+submodule_has_consistent_remote_names() {
+  local submodule_path="$1" expected_name="$2" remote_name="" remote_url="" remote_repo=""
+  [[ -e "$submodule_path/.git" ]] || return 0
+  while IFS= read -r remote_name; do
+    remote_url="$(git -C "$submodule_path" remote get-url "$remote_name" 2>/dev/null)" || continue
+    remote_repo="$(repo_name_from_git_url "$remote_url")" || continue
+    [[ "$remote_repo" == "$expected_name" ]] || return 1
+  done < <(git -C "$submodule_path" remote 2>/dev/null)
+}
+# 保留已有清单 URL；新增条目只依据真实 remote 或同 namespace 配置生成。
 gitmodules_url_for_path() {
-  local submodule_path="$1"
-  local style=""
-  style="$(gitmodules_preferred_style)"
-
-  if [[ "$style" == "ssh" ]]; then
-    repo_ssh_by_path "$submodule_path"
-  else
-    repo_https_by_path "$submodule_path"
+  local submodule_path="$1" section="" current_url="" parent_url="" parent_scope="" source_url="" source_scope=""
+  section="$(find_gitmodules_section_by_path "$submodule_path" 2>/dev/null || true)"
+  if [[ -n "$section" ]]; then
+    current_url="$(git config -f .gitmodules --get "submodule.$section.url" 2>/dev/null || true)"
+    [[ -z "$current_url" ]] || { printf '%s\n' "$current_url"; return 0; }
   fi
+  parent_url="$(git remote get-url "$REMOTE_NAME" 2>/dev/null)" || {
+    error_echo "父仓远端不存在：$REMOTE_NAME；无法确定子模块来源：$submodule_path"
+    return 1
+  }
+  parent_scope="$(git_remote_scope "$parent_url")" || return 1
+  source_url="$(configured_git_url_by_path "$submodule_path")" || return 1
+  source_scope="$(git_remote_scope "$source_url")" || return 1
+
+  local remote_name="" child_url="" child_scope="" child_identity="" selected_url="" selected_identity=""
+  if [[ -e "$submodule_path/.git" ]]; then
+    while IFS= read -r remote_name; do
+      child_url="$(git -C "$submodule_path" remote get-url "$remote_name" 2>/dev/null)" || continue
+      child_scope="$(git_remote_scope "$child_url")" || continue
+      [[ "${child_scope%%|*}" == "${parent_scope%%|*}" ]] || continue
+      child_identity="$child_scope|$(repo_name_from_git_url "$child_url")"
+      if [[ -n "$selected_identity" && "$selected_identity" != "$child_identity" ]]; then
+        error_echo "子仓在所选平台有多个不同地址，请先在 .gitmodules 明确配置：$submodule_path"
+        return 1
+      fi
+      selected_url="$child_url"
+      selected_identity="$child_identity"
+    done < <(git -C "$submodule_path" remote 2>/dev/null)
+  fi
+  if [[ -n "$selected_url" ]]; then
+    if [[ "$(git_remote_scope "$selected_url")" == "$parent_scope" ]] &&
+       submodule_has_consistent_remote_names "$submodule_path" "$(repo_name_from_git_url "$selected_url")"; then
+      printf '../%s.git\n' "$(repo_name_from_git_url "$selected_url")"
+    else
+      printf '%s\n' "$selected_url"
+    fi
+    return 0
+  fi
+  if [[ "$source_scope" == "$parent_scope" ]] &&
+     submodule_has_consistent_remote_names "$submodule_path" "$(repo_name_from_git_url "$source_url")"; then
+    printf '../%s.git\n' "$(repo_name_from_git_url "$source_url")"
+    return 0
+  fi
+
+  if [[ "${source_scope%%|*}" == "${parent_scope%%|*}" ]]; then
+    printf '%s\n' "$source_url"
+    return 0
+  fi
+  error_echo "无法确认 $submodule_path 在远端 $REMOTE_NAME 的对应地址；请在 .gitmodules 明确配置目标 URL，或为本地子仓添加已核实的对应 remote。"
+  return 1
+}
+# 提取远端真实仓名，不从本地目录名推断。
+repo_name_from_git_url() {
+  local parsed=""
+  parsed="$(parse_git_remote_url "$1")" || return 1
+  printf '%s\n' "${parsed##*|}"
 }
 # 封装 gitmodules url points to config repo 对应的独立处理逻辑。
-gitmodules_url_points_to_config_repo() {
-  local actual_url="$1"
-  local submodule_path="$2"
-  local normalized=""
-  normalized="$(normalize_git_url "$actual_url" 2>/dev/null || true)"
-  [[ -n "$normalized" ]] || return 1
-
-  local actual_page="${normalized%%|*}"
-  local expected_page=""
-  expected_page="$(repo_page_by_path "$submodule_path")" || return 1
-
-  [[ "$actual_page" == "$expected_page" ]]
-}
 # 清理 remove gitmodules entry by path 对应的目标内容。
 remove_gitmodules_entry_by_path() {
   local submodule_path="$1"
@@ -942,51 +1116,44 @@ remove_gitmodules_entry_by_path() {
   fi
 }
 # 检查 ensure gitmodules entry 所需条件，不满足时阻止继续执行。
+# 增量补齐缺项，保留已有 URL、分支与扩展字段。
 ensure_gitmodules_entry() {
-  local submodule_path="$1"
-  ensure_gitmodules_file_exists
-
-  local desired_url=""
-  desired_url="$(gitmodules_url_for_path "$submodule_path")"
-
-  local section=""
+  local submodule_path="$1" section="" desired_url="${2:-}" new_section=0
+  ensure_gitmodules_file_exists || return 1
   section="$(find_gitmodules_section_by_path "$submodule_path" 2>/dev/null || true)"
-  [[ -z "$section" ]] && section="$submodule_path"
-
-  local changed=0
-  local cur_path=""
-  local cur_url=""
-  local cur_branch=""
-
+  if [[ -z "$section" ]]; then
+    section="$submodule_path"
+    new_section=1
+  fi
+  local changed=0 cur_path="" cur_url="" cur_branch=""
   cur_path="$(git config -f .gitmodules --get "submodule.$section.path" 2>/dev/null || true)"
   cur_url="$(git config -f .gitmodules --get "submodule.$section.url" 2>/dev/null || true)"
   cur_branch="$(git config -f .gitmodules --get "submodule.$section.branch" 2>/dev/null || true)"
-
-  if [[ "$cur_path" != "$submodule_path" ]]; then
-    run_cmd git config -f .gitmodules "submodule.$section.path" "$submodule_path"
-    changed=1
-  fi
-
-  # 关键：现有 .gitmodules 只要 URL 指向同一个 GitHub 仓库，就不强行改协议。
-  # 例如你上传的 .gitmodules 全部是 https，这是合法的；父仓是 ssh 时，实际同步阶段会单独把子仓 origin 改成 ssh。
   if [[ -z "$cur_url" ]]; then
-    run_cmd git config -f .gitmodules "submodule.$section.url" "$desired_url"
-    changed=1
-  elif ! gitmodules_url_points_to_config_repo "$cur_url" "$submodule_path"; then
-    warn_echo ".gitmodules 中 $submodule_path 的 url 指向了非配置仓库，已修正"
-    run_cmd git config -f .gitmodules "submodule.$section.url" "$desired_url"
+    [[ -n "$desired_url" ]] || desired_url="$(gitmodules_url_for_path "$submodule_path")" || return 1
+    if [[ "$desired_url" == ./* || "$desired_url" == ../* ]]; then
+      resolve_relative_git_url "$(git remote get-url "$REMOTE_NAME")" "$desired_url" >/dev/null || return 1
+    elif ! parse_git_remote_url "$desired_url" >/dev/null; then
+      error_echo "子模块目标地址无效或含凭据，未写入 .gitmodules：$submodule_path"
+      return 1
+    fi
+  fi
+  if [[ "$cur_path" != "$submodule_path" ]]; then
+    run_cmd git config -f .gitmodules "submodule.$section.path" "$submodule_path" || return 1
     changed=1
   fi
-
-  if [[ "$cur_branch" != "$SUBMODULE_BRANCH" ]]; then
-    run_cmd git config -f .gitmodules "submodule.$section.branch" "$SUBMODULE_BRANCH"
+  if [[ -z "$cur_url" ]]; then
+    run_cmd git config -f .gitmodules "submodule.$section.url" "$desired_url" || return 1
     changed=1
   fi
-
-  if [[ "$changed" == "1" ]]; then
-    note_echo ".gitmodules 已查漏补缺/修复：$submodule_path"
+  if [[ "$new_section" == 1 && -z "$cur_branch" ]]; then
+    run_cmd git config -f .gitmodules "submodule.$section.branch" "$SUBMODULE_BRANCH" || return 1
+    changed=1
+  fi
+  if [[ "$changed" == 1 ]]; then
+    note_echo ".gitmodules 已查漏补缺：$submodule_path"
   else
-    info_echo ".gitmodules 已存在且合法，保持不动：$submodule_path"
+    info_echo ".gitmodules 已存在，保留 URL、分支与扩展字段：$submodule_path"
   fi
 }
 # 封装 prune unconfigured gitmodules 对应的独立处理逻辑。
@@ -1031,7 +1198,7 @@ reconcile_gitmodules_with_config_once() {
 
   local p=""
   for p in "${CONFIG_PATHS[@]}"; do
-    ensure_gitmodules_entry "$p"
+    ensure_gitmodules_entry "$p" || return 1
   done
 
   prune_unconfigured_gitmodules
@@ -1102,7 +1269,7 @@ remove_worktree_dir_safely() {
 clone_submodule_worktree() {
   local submodule_path="$1"
   local url=""
-  url="$(clone_url_for_path "$submodule_path")"
+  url="$(clone_url_for_path "$submodule_path")" || return 1
   local branch=""
   branch="$(remote_branch_for_url "$url" "$SUBMODULE_BRANCH")"
 
@@ -1134,7 +1301,7 @@ ensure_submodule_worktree_present() {
   local submodule_path="$1"
 
   # 不走 git submodule update 做首次下载，因为它会严格使用 .gitmodules 的 url。
-  # 这里直接按父仓 origin 推导出的 HTTPS/SSH 克隆地址下载，满足“父仓什么协议，子仓同步就用什么协议”。
+  # 这里按 .gitmodules 与所选父 remote 的完整地址解析下载，保留绝对 URL 例外。
   if [[ -e "$submodule_path" ]]; then
     if is_git_worktree "$submodule_path"; then
       assert_clean_submodule "$submodule_path" "纳入子模块" || return 1
@@ -1187,7 +1354,7 @@ resolve_remote_branch_for_submodule() {
 sync_one_submodule_to_latest() {
   local submodule_path="$1"
   local url=""
-  url="$(clone_url_for_path "$submodule_path")"
+  url="$(clone_url_for_path "$submodule_path")" || return 1
 
   if [[ ! -e "$submodule_path" ]]; then
     warn_echo "本地目录不存在，跳过：$submodule_path"
@@ -1228,6 +1395,8 @@ sync_one_submodule_to_latest() {
   run_cmd git -C "$submodule_path" -c core.quotepath=false checkout -B "$branch" "origin/$branch"
   run_cmd git -C "$submodule_path" branch --set-upstream-to="origin/$branch" "$branch" >/dev/null 2>&1 || true
   run_cmd git -C "$submodule_path" reset --hard "origin/$branch"
+
+  sync_submodule_urls_at_repo "$PWD/$submodule_path" "$url" || return 1
 
   local -a submodule_update_args
   submodule_update_args=(submodule update --init --recursive --jobs="$(get_ncpu)")
@@ -1317,7 +1486,7 @@ full_sync_to_latest() {
   done
 
   sync_selected_submodules_to_latest "${synced_paths[@]}"
-  run_cmd git submodule sync --recursive || true
+  sync_submodule_urls_for_remote || return 1
   stage_and_commit_parent_changes "${synced_paths[@]}"
   parent_push_if_needed
   success_echo "全量同步完成"
@@ -1350,7 +1519,7 @@ update_existing_to_latest() {
   reconcile_gitmodules_with_config_once
   info_echo "只同步当前已有的子 Git 目录：${existing_paths[*]}"
   sync_selected_submodules_to_latest "${existing_paths[@]}"
-  run_cmd git submodule sync --recursive || true
+  sync_submodule_urls_for_remote || return 1
   stage_and_commit_parent_changes "${existing_paths[@]}"
   parent_push_if_needed
   success_echo "已有子模块同步完成"
@@ -1369,10 +1538,10 @@ validate_remote_access_or_loop_continue() {
 add_new_git_url_interactive() {
   while true; do
     echo ""
-    echo "请输入新的 GitHub 仓库地址："
-    echo "  支持：https://github.com/JobsKits/JobsGenesis"
-    echo "  支持：https://github.com/JobsKits/JobsGenesis.git"
-    echo "  支持：git@github.com:JobsKits/JobsGenesis.git"
+    echo "请输入新的 Git 仓库地址（任意托管站点）："
+    echo "  支持：https://git.example.com/group/project"
+    echo "  支持：ssh://git@git.example.com:2222/group/project.git"
+    echo "  支持：git@git.example.com:group/project.git"
     echo "  输入一个空格后回车：返回上一页"
     printf 'Git 地址：'
 
@@ -1383,6 +1552,8 @@ add_new_git_url_interactive() {
       note_echo "返回上一页"
       return 0
     fi
+
+    input="$(trim_string "$input")"
 
     local normalized=""
     if ! normalized="$(normalize_git_url "$input")"; then
@@ -1400,23 +1571,24 @@ add_new_git_url_interactive() {
 
     local style=""
     style="$(detect_git_url_style)"
-    local clone_url="$https_url"
-    [[ "$style" == "ssh" ]] && clone_url="$ssh_url"
+    local clone_url="$input"
+    clone_url="$(git_url_with_style "$clone_url")" || continue
 
     validate_remote_access_or_loop_continue "$clone_url" || continue
 
+    SUBMODULE_REPO_URLS+=("$input|$local_path")
     append_runtime_submodule "$page_url" "$https_url" "$ssh_url" "$repo_name" "$local_path"
-    ensure_gitmodules_entry "$local_path"
+    ensure_gitmodules_entry "$local_path" "$input" || continue
     GITMODULES_RECONCILED=1
     sync_selected_submodules_to_latest "$local_path"
-    run_cmd git submodule sync --recursive || true
+    sync_submodule_urls_for_remote || return 1
     stage_and_commit_parent_changes "$local_path"
     parent_push_if_needed
 
     success_echo "已添加并同步新子模块：$local_path -> $clone_url"
     echo ""
     echo "如果希望以后固定保留，请把下面这一行加入脚本顶部 SUBMODULE_REPO_URLS："
-    echo "  \"$page_url\""
+    echo "  \"$input|$local_path\""
     echo ""
     echo "按 [Enter] 返回菜单"
     local dummy=""
@@ -1439,7 +1611,7 @@ build_submodule_picker_content() {
   - 第一项“全选”会一次勾选 / 取消全部 SUBMODULE_REPO_URLS 项目
   - 按 ← 返回上一页
 
-子模块同步 URL 模式: $style（auto 时继承父仓 origin）
+子模块同步 URL 模式: $style（auto 保留绝对地址；相对地址继承 $REMOTE_NAME）
 子模块分支优先级: $SUBMODULE_BRANCH
 子仓浅克隆: $SUBMODULE_SHALLOW_CLONE
 浅克隆深度: $SUBMODULE_DEPTH
@@ -1616,7 +1788,7 @@ select_configured_submodules_interactive() {
         reconcile_gitmodules_with_config_once
         info_echo "开始同步已选择的子模块：${selected_paths[*]}"
         sync_selected_submodules_to_latest "${selected_paths[@]}"
-        run_cmd git submodule sync --recursive || true
+        sync_submodule_urls_for_remote || return 1
         stage_and_commit_parent_changes "${selected_paths[@]}"
         parent_push_if_needed
         success_echo "已选择子模块同步完成"
@@ -1664,7 +1836,7 @@ build_intro_content() {
   local style=""
   style="$(detect_git_url_style 2>/dev/null || echo https)"
   local gm_style=""
-  gm_style="$(gitmodules_preferred_style 2>/dev/null || echo "$style")"
+  gm_style="保留已有地址；缺项优先相对，映射不明时停止"
 
   cat <<EOF2
 📘 Git 子模块批量管理脚本
@@ -1673,8 +1845,8 @@ build_intro_content() {
 当前目录: $(pwd)
 父仓远端: $REMOTE_NAME
 子模块分支优先级: $SUBMODULE_BRANCH
-子模块同步 URL 模式: $style（auto 时继承父仓 origin）
-.gitmodules 补缺 URL 模式: $gm_style（已有合法条目不改，只补缺）
+子模块同步 URL 模式: $style（auto 保留绝对地址；相对地址继承 $REMOTE_NAME）
+.gitmodules 补缺 URL 模式: $gm_style
 干跑: $DRY_RUN
 自动提交父仓: $AUTO_PARENT_COMMIT
 自动推送父仓: $AUTO_PARENT_PUSH
@@ -1688,16 +1860,14 @@ EOF2
   local p=""
   local display_path=""
   local page_url=""
-  local https_url=""
-  local ssh_url=""
+  local resolved_url=""
   local gm_section=""
   local gm_status=""
 
   for p in "${CONFIG_PATHS[@]}"; do
     display_path="$(preview_safe_text "$p")"
     page_url="$(repo_page_by_path "$p")"
-    https_url="$(repo_https_by_path "$p")"
-    ssh_url="$(repo_ssh_by_path "$p")"
+    resolved_url="$(clone_url_for_path "$p" 2>/dev/null || echo "目标地址未确认，请先配置 .gitmodules")"
     gm_section="$(find_gitmodules_section_by_path "$p" 2>/dev/null || true)"
     if [[ -n "$gm_section" ]]; then
       gm_status="已存在"
@@ -1706,9 +1876,8 @@ EOF2
     fi
 
     printf '  - %s\n' "$display_path"
-    printf '      page       : %s\n' "$page_url"
-    printf '      https      : %s\n' "$https_url"
-    printf '      ssh        : %s\n' "$ssh_url"
+    printf '      配置参考   : %s\n' "$page_url"
+    printf '      实际下载   : %s\n' "$resolved_url"
     printf '      .gitmodules: %s\n' "$gm_status"
   done
 

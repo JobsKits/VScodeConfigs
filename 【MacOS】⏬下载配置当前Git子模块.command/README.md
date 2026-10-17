@@ -10,6 +10,35 @@
 
 `【MacOS】⏬下载配置当前Git子模块.command` 用于执行“【MacOS】⏬下载配置当前Git子模块”对应的 MacOS 自动化流程。主脚本与本 `README.md` 必须保持在同一目录，运行前先阅读影响范围。
 
+<strong id="submodule-quick-look">先看例子：从哪个平台下载父仓，子仓就跟着走</strong>
+
+以本仓 `VScodeConfigs` 的 `🐦VScodeConfigByFlutter` 子模块为例。先对照固定到 [**GitHub**](https://github.com) 的写法（仅作对照，不代表本仓历史配置）：
+
+```ini
+url = https://github.com/JobsKits/VScodeConfigByFlutter.git
+```
+
+当前 [`.gitmodules`](../.gitmodules) 使用相对地址：
+
+```ini
+[submodule "🐦VScodeConfigByFlutter"]
+    path = 🐦VScodeConfigByFlutter
+    url = ../VScodeConfigByFlutter.git
+    branch = main
+```
+
+同一条 `url` 根据父仓地址解析，支持 [**Gitee**](https://gitee.com) 和任意自建平台；自建地址仅作示例：
+
+| 所选父仓 remote 地址 | 子仓实际地址 |
+| --- | --- |
+| `https://github.com/JobsKits/VScodeConfigs.git` | `https://github.com/JobsKits/VScodeConfigByFlutter.git` |
+| `https://gitee.com/JobsGo/VScodeConfigs.git` | `https://gitee.com/JobsGo/VScodeConfigByFlutter.git` |
+| `ssh://git@git.example.com:2222/team/tools/VScodeConfigs.git` | `ssh://git@git.example.com:2222/team/tools/VScodeConfigByFlutter.git` |
+
+`path` 是本地目录名，`url` 中必须写真实远端仓名；这里本地目录带 `🐦`，远端仓名不带。目标平台必须已有子仓镜像，并包含父仓 gitlink 指定的提交。
+
+本下载脚本用 `REMOTE_NAME` 选择父仓线路，默认 `origin`；本仓已有 `gitee` remote，使用 `REMOTE_NAME=gitee` 可按 Gitee 父仓地址解析相对 URL。已有绝对 URL 例外仍按其明确地址下载，脚本保留它，不会因选了 `gitee` 就强行替换。新登记缺少目标平台真实地址证据时会停止；完整参数见[多平台子模块地址](#submodule-address-rules)。
+
 ## 一、适用场景 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
 - 需要执行“【MacOS】⏬下载配置当前Git子模块”所描述的本机开发或维护任务。
@@ -48,10 +77,10 @@ cd "脚本所在目录/【MacOS】⏬下载配置当前Git子模块.command"
 
 ## 五、操作流程 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
-1. 展示脚本自述或同目录 `README.md`。
-2. 检查运行环境、输入参数和目标路径。
-3. 按脚本提示确认需要执行的业务步骤。
-4. 输出执行结果、失败原因和日志位置。
+1、展示脚本内置自述并等待回车。
+2、检查运行环境、输入参数和目标路径。
+3、按脚本提示确认需要执行的业务步骤。
+4、输出执行结果、失败原因和日志位置。
 
 ## 六、风险说明 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
@@ -91,5 +120,23 @@ $TMPDIR/【MacOS】⏬下载配置当前Git子模块.log
 README 只描述脚本职责和通用风险，不代表已经在当前 MacOS 环境执行真实业务命令。交付前应至少通过对应 Shell 的静态语法检查。
 
 [**Homebrew**](https://brew.sh/) 安装路径由用户选择：已有可运行安装时复用；确实需要安装时先强提示，只有精确输入大写 `YES` 才选择系统标准目录，其它输入或直接回车选择当前用户的 `.local/homebrew`。`YES` 只表示选择路径，权限与密码由官方安装器实际处理；有管理员权限也可以选用户目录。选定路径失败立即停止，不自动切换；`Ctrl+C` / 输入结束取消整个任务。
+
+## 十、<span id="submodule-address-rules">多平台子模块地址</span> <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
+
+- 支持 [**GitHub**](https://github.com)、[**Gitee**](https://gitee.com)、[**GitLab**](https://about.gitlab.com) 和自建 Git 服务器；接受 HTTPS、`git@host:namespace/repo.git` 和 `ssh://git@host:端口/namespace/repo.git`，保留嵌套 namespace 与显式端口。配置中禁止携带 HTTP 用户凭据或 SSH 密码。
+- `REMOTE_NAME` 默认 `origin`。已有 `.gitmodules` 的 URL、分支、缺省分支和扩展字段保持原样；`../真实仓名.git` 随所选父 remote 的平台、namespace、协议与端口解析，仓名不从本地目录猜测。
+- 新条目依据真实子仓 remote 与父 remote 的对应关系生成相对 URL。已知镜像仓名不同、跨组织或端口不匹配时保留已确认的绝对地址；缺少目标平台地址证据时停止并提示在 `.gitmodules` 配置真实 URL，不自动退回其它平台。
+- 递归同步逐层使用各自父仓地址。绝对子仓下面的相对子模块，以该绝对子仓为基准继续解析。
+- `GIT_URL_STYLE=auto` 保留实际地址；显式指定 `https` 或 `ssh` 只转换无歧义地址，无法推断跨协议端口时停止。`AUTO_PARENT_COMMIT` 默认 `1`，`AUTO_PARENT_PUSH` 默认 `0`；需要只同步并保留修改待检查时，将自动提交设为 `0`。
+
+父仓已配置名为 `gitee` 的 remote 时，可以在脚本所在目录运行：
+
+```shell
+REMOTE_NAME=gitee \
+AUTO_PARENT_COMMIT=0 \
+./【MacOS】⏬下载配置当前Git子模块.command
+```
+
+普通 `git clone --recurse-submodules` 由 Git 依据父仓默认 remote 解析相对 URL；`REMOTE_NAME` 是本脚本的线路选择参数。
 
 <a id="🔚" href="#前言" style="font-size:17px; color:green; font-weight:bold;">我是有底线的➤点我回到首页</a>
