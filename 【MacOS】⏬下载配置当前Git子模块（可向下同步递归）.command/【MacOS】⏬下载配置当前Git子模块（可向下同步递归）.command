@@ -4,8 +4,8 @@
 # - 来源日志：克隆 / 拉取前突出平台与完整地址，完成时带来源，保留递归来源核对。
 # - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS，递归子模块继承，不写全局配置。
 # - 核心用途：按各仓独立清单下载、更新和登记 Git 子模块；可逐层同步所选子树，也可只同步直属一层。
-# - 影响范围：父仓登记、索引与提交，子仓工作区和分支；全量模式仅删除清单目标及对应旧仓名目录。
-# - 运行提示：先阅读内置自述并回车确认；全量重建另需 YES；Ctrl+C 取消，默认提交父仓但不推送。
+# - 影响范围：父仓登记、索引与提交，子仓工作区和分支；已有子仓复用更新，空目录首次初始化。
+# - 运行提示：先阅读内置自述并回车确认；未提交内容逐仓等待 YES 放弃或外部处理；Ctrl+C 取消，默认提交父仓但不推送。
 
 # 仅渲染自述：标题红色加粗，编号正文蓝色常规字重；非彩色终端输出纯文本。
 # >>> Jobs Homebrew install choice >>>
@@ -230,11 +230,11 @@ SUBMODULE_REPO_URLS=(
 SUBMODULE_BRANCH="${SUBMODULE_BRANCH:-main}"          # 优先同步的子模块分支；远端没有该分支时自动使用远端默认分支
 REMOTE_NAME="${REMOTE_NAME:-origin}"                  # 父仓远端名
 DRY_RUN="${DRY_RUN:-0}"                                # 1=只打印动作，不执行
-FORCE_DELETE="${FORCE_DELETE:-0}"                      # 1=允许删除非 Git 且非空的冲突目录；默认拒绝，避免误删
+FORCE_DELETE="${FORCE_DELETE:-0}"                      # 1=显式裁剪时允许删除非 Git 非空旧目录；仍逐仓要求 YES
 AUTO_PARENT_COMMIT="${AUTO_PARENT_COMMIT:-1}"          # 1=自动提交 .gitmodules/gitlink 变化
 AUTO_PARENT_PUSH="${AUTO_PARENT_PUSH:-0}"              # 1=自动推送父仓；默认不推送，避免跨机器误推
 GIT_URL_STYLE="${GIT_URL_STYLE:-auto}"                  # auto/https/ssh；默认继承所选父 remote 的完整地址
-PRUNE_STALE_GITMODULES="${PRUNE_STALE_GITMODULES:-0}"  # 1=删除 .gitmodules 中已经不在 SUBMODULE_REPO_URLS 的旧子模块；默认只查漏补缺
+PRUNE_STALE_GITMODULES="${PRUNE_STALE_GITMODULES:-0}"  # 1=逐仓 YES 后裁剪清单外旧登记；默认只查漏补缺
 SUBMODULE_SHALLOW_CLONE="${SUBMODULE_SHALLOW_CLONE:-1}"    # 1=子仓浅克隆，只拿最新必要历史；0=完整克隆
 SUBMODULE_DEPTH="${SUBMODULE_DEPTH:-1}"                    # 浅克隆深度；默认 1，只锚定最新一层提交
 SUBMODULE_FETCH_TAGS="${SUBMODULE_FETCH_TAGS:-0}"          # 1=同步 tags；默认 0，软件大包仓库不拉 tags 更快
@@ -928,11 +928,13 @@ clone_url_for_path() {
 validate_submodule_url_path() {
   local repo_root="$1" submodule_path="$2" component="" child_root="" child_git_root=""
   [[ -n "$submodule_path" && "$submodule_path" != /* && "$submodule_path" != *$'\n'* && "$submodule_path" != *$'\r'* ]] || return 1
-  for component in "${(@s:/:)submodule_path}"; do
-    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
-  done
   repo_root="${repo_root:A}"
-  child_root="$repo_root/$submodule_path"
+  child_root="$repo_root"
+  for component in "${(@s:/:)submodule_path}"; do
+    [[ -n "$component" && "$component" != . && "$component" != .. && "$component" != .git ]] || return 1
+    child_root="$child_root/$component"
+    [[ ! -L "$child_root" ]] || return 1
+  done
   child_root="${child_root:A}"
   [[ "$child_root" == "$repo_root"/* ]] || return 1
   if [[ -e "$child_root/.git" ]]; then
@@ -1088,36 +1090,91 @@ is_dir_empty() {
   entries=("$submodule_path"/*(DN))
   [[ ${#entries} -eq 0 ]]
 }
-# 封装 assert_clean_submodule 对应的独立处理逻辑。
+# 高风险提示在终端使用红色粗体，日志保留纯文本。
+submodule_risk_echo() {
+  local message="$1"
+  printf '%s\n' "❌ $message" >> "$LOG_FILE"
+  if [[ -t 2 && -n "${TERM:-}" && "${TERM:-}" != dumb && -z "${NO_COLOR+x}" &&
+        "${PLAIN_OUTPUT:-0}" != 1 && "${IS_SOURCETREE_RUNTIME:-0}" != 1 ]]; then
+    printf '\033[1;31m❌ %s\033[0m\n' "$message" >&2
+  else
+    printf '%s\n' "❌ $message" >&2
+  fi
+}
+# 只列当前仓源码和已暂存内容，忽略同步产生的后代 HEAD 漂移。
+submodule_own_changes() {
+  local submodule_path="$1" dirty="" staged=""
+  dirty="$(git -C "$submodule_path" -c core.quotepath=false status --porcelain --untracked-files=all --ignore-submodules=all)" || return 1
+  staged="$(git -C "$submodule_path" -c core.quotepath=false diff --cached --name-status --ignore-submodules=none --)" || return 1
+  [[ -z "$dirty" ]] || printf '%s\n' "$dirty"
+  [[ -z "$staged" ]] || printf '已暂存（含子模块指针）：\n%s\n' "$staged"
+  return 0
+}
+# 循环等待当前仓变干净；YES 仅放弃本仓内容，不递归清理后代。
+wait_for_clean_submodule() {
+  local submodule_path="$1" action="$2" dirty="" answer="" repo_root=""
+  repo_root="${submodule_path:A}"
+  while true; do
+    if ! is_git_worktree "$repo_root"; then
+      error_echo "等待期间子仓已不可用，停止${action}：$repo_root"
+      return 1
+    fi
+    dirty="$(submodule_own_changes "$repo_root")" || return 1
+    [[ -n "$dirty" ]] || return 0
+    submodule_risk_echo "子 Git 存在尚未提交内容，暂停${action}。仓库：$repo_root"
+    submodule_risk_echo "$dirty"
+    submodule_risk_echo '输入精确大写 YES：放弃上述仓库自己的已暂存、未暂存和未跟踪内容；忽略文件及嵌套 Git 仓保留，后代有改动会另行确认。'
+    if [[ "$DRY_RUN" == 1 || ! -t 0 || "${IS_SOURCETREE_RUNTIME:-0}" == 1 ]]; then
+      error_echo "演练或无交互模式不能确认放弃内容，未执行清理：$repo_root"
+      return 1
+    fi
+    if ! IFS= read -r "answer?👉 输入 YES 放弃本仓改动；或在外部处理后按回车重新检查（Ctrl+C 取消）："; then
+      error_echo "输入已结束，停止${action}并保留尚未处理的内容：$repo_root"
+      return 1
+    fi
+    if [[ "$answer" == YES ]]; then
+      run_cmd git -C "$repo_root" -c submodule.recurse=false reset --hard HEAD || return 1
+      run_cmd git -C "$repo_root" -c submodule.recurse=false clean -fd -- || return 1
+      note_echo "已按 YES 放弃当前仓未提交内容，重新检查：$repo_root"
+    else
+      info_echo "未收到 YES，重新检查；仍有改动将继续等待：$repo_root"
+    fi
+  done
+}
+# 从索引与 HEAD 收集子仓，防止待放弃的 .gitmodules 改动隐藏已有后代。
+submodule_children_for_protection() {
+  local repo_root="$1" index_entries="" head_entries="" entry="" child_path=""
+  local -a children
+  children=()
+  index_entries="$(git -C "$repo_root" ls-files --stage -z)" || return 1
+  head_entries="$(git -C "$repo_root" ls-tree -rz --full-tree HEAD)" || return 1
+  for entry in "${(@0)index_entries}" "${(@0)head_entries}"; do
+    [[ "$entry" == '160000 '* ]] || continue
+    child_path="${entry#*$'\t'}"
+    validate_submodule_url_path "$repo_root" "$child_path" || return 1
+    if ! contains_item "$child_path" "${children[@]}"; then
+      children+=("$child_path")
+    fi
+  done
+  [[ ${#children} -eq 0 ]] || printf '%s\n' "${children[@]}"
+  return 0
+}
+# 更新祖先前保护已初始化后代；每仓单独等待确认，不将一次 YES 扩大到整棵树。
 assert_clean_submodule() {
-  local submodule_path="$1"
-  local action="$2"
-
-  if ! is_git_worktree "$submodule_path"; then
-    return 0
+  local submodule_path="$1" action="$2" children="" current_children="" child_path=""
+  is_git_worktree "$submodule_path" || return 0
+  if [[ "$SUBMODULE_RECURSIVE" == 1 ]]; then
+    children="$(submodule_children_for_protection "$submodule_path")" || return 1
   fi
-
-  local dirty=""
-  dirty="$(git -C "$submodule_path" -c core.quotepath=false status --porcelain --untracked-files=normal --ignore-submodules=all)" || return 1
-  if [[ -n "$dirty" ]]; then
-    error_echo "子 Git 存在尚未提交内容，已终止${action}：$submodule_path"
-    printf '%s\n' "$dirty"
-    return 1
-  fi
-
-  if ! git -C "$submodule_path" diff --cached --quiet --ignore-submodules=none --; then
-    error_echo "子 Git 存在已暂存内容或子模块指针，已终止${action}：$submodule_path"
-    return 1
-  fi
-
-  # 允许此前同步产生的后代 HEAD 差异，但在更新祖先前先保护后代源码。
-  if [[ "$SUBMODULE_RECURSIVE" == 1 && -f "$submodule_path/.gitmodules" ]]; then
-    local keys="" key="" child_path=""
-    keys="$(submodule_path_keys "$submodule_path")" || return 1
-    for key in "${(@f)keys}"; do
-      [[ -n "$key" ]] || continue
-      child_path="$(git config -f "$submodule_path/.gitmodules" --get "$key")" || return 1
-      validate_submodule_url_path "$PWD/$submodule_path" "$child_path" || return 1
+  wait_for_clean_submodule "$submodule_path" "$action" || return 1
+  if [[ "$SUBMODULE_RECURSIVE" == 1 ]]; then
+    current_children="$(submodule_children_for_protection "$submodule_path")" || return 1
+    local -a checked
+    checked=()
+    for child_path in "${(@f)children}" "${(@f)current_children}"; do
+      [[ -n "$child_path" ]] || continue
+      contains_item "$child_path" "${checked[@]}" && continue
+      checked+=("$child_path")
       assert_clean_submodule "$submodule_path/$child_path" "$action" || return 1
     done
   fi
@@ -1292,7 +1349,29 @@ ensure_gitmodules_entry() {
     info_echo ".gitmodules 已存在，保留 URL、分支与扩展字段：$submodule_path"
   fi
 }
-# 封装 prune_unconfigured_gitmodules 对应的独立处理逻辑。
+# 显式启用旧登记裁剪时另行确认，不能复用全量同步或脏仓放弃授权。
+confirm_stale_submodule_removal() {
+  local submodule_path="$1" answer=""
+  submodule_risk_echo "PRUNE_STALE_GITMODULES=1：准备移除清单外旧登记及目录：${submodule_path:A}"
+  submodule_risk_echo '此项会删除该目录及其后代，本地独有提交可能失去工作区引用；这是显式裁剪，不是正常同步。'
+  if [[ "$DRY_RUN" == 1 ]]; then
+    note_echo "[DRY-RUN] 仅展示旧登记裁剪，不执行删除：$submodule_path"
+    return 0
+  fi
+  if [[ ! -t 0 || "${IS_SOURCETREE_RUNTIME:-0}" == 1 ]]; then
+    error_echo "旧登记裁剪必须在交互终端逐仓输入 YES，未执行删除：$submodule_path"
+    return 1
+  fi
+  if ! IFS= read -r "answer?👉 输入 YES 删除上述旧登记及目录；其它输入停止裁剪："; then
+    error_echo "输入已结束，未执行旧登记裁剪：$submodule_path"
+    return 1
+  fi
+  if [[ "$answer" != YES ]]; then
+    error_echo "未输入 YES，停止旧登记裁剪并保留目标：$submodule_path"
+    return 1
+  fi
+}
+# 仅在显式启用并逐仓确认后移除清单外登记。
 prune_unconfigured_gitmodules() {
   [[ "$PRUNE_STALE_GITMODULES" == "1" ]] || return 0
   [[ -f .gitmodules ]] || return 0
@@ -1302,8 +1381,18 @@ prune_unconfigured_gitmodules() {
     [[ -z "$existing_path" ]] && continue
 
     if ! contains_item "$existing_path" "${CONFIG_PATHS[@]}"; then
+      if ! validate_submodule_url_path "$PWD" "$existing_path"; then
+        error_echo "旧登记路径不是安全的独立子仓目录，停止裁剪：$existing_path"
+        return 1
+      fi
       warn_echo "发现 .gitmodules 中不再属于 SUBMODULE_REPO_URLS 的旧子模块：$existing_path"
-      assert_clean_submodule "$existing_path" "移除旧子模块配置" || return 1
+      confirm_stale_submodule_removal "$existing_path" || return 1
+      if ! (
+        SUBMODULE_RECURSIVE=1
+        assert_clean_submodule "$existing_path" "移除旧子模块配置"
+      ); then
+        return 1
+      fi
 
       if is_gitlink_registered "$existing_path"; then
         run_cmd git rm -f --cached -- "$existing_path" >/dev/null 2>&1 || true
@@ -1359,17 +1448,7 @@ unique_paths_from_stdin() {
     printf '%s\n' "$p"
   done
 }
-# 封装 collect_full_delete_targets 对应的独立处理逻辑。
-collect_full_delete_targets() {
-  {
-    local p=""
-    for p in "${CONFIG_PATHS[@]}"; do
-      printf '%s\n' "$p"
-      repo_name_by_path "$p" 2>/dev/null || true
-    done
-  } | unique_paths_from_stdin
-}
-# 按真实 section 定位目标缓存，删除前核验边界、工作区归属和独立引用。
+# 按真实 section 定位既有缓存，核验边界、工作区归属和独立引用。
 submodule_cache_for_removal() {
   local submodule_path="$1" section="" parent_git_dir="" modules_root="" cache_dir=""
   local worktree="" expected_worktree="" actual_git_dir="" key="" other_section="" other_path=""
@@ -1398,7 +1477,7 @@ submodule_cache_for_removal() {
   cache_dir="$modules_root/$section"
   [[ -e "$cache_dir" || -L "$cache_dir" ]] || return 0
   if [[ ! -d "$cache_dir" || -L "$modules_root" || "${cache_dir:A}" != "$cache_dir" ]]; then
-    error_echo "子模块缓存不是父仓 modules 下的普通目录，拒绝删除：$cache_dir"
+    error_echo "子模块缓存不是父仓 modules 下的普通目录，拒绝复用：$cache_dir"
     return 1
   fi
   while IFS= read -r key; do
@@ -1406,72 +1485,55 @@ submodule_cache_for_removal() {
     other_section="${other_section%.path}"
     other_path="$(git config -f .gitmodules --get "$key")" || return 1
     if [[ "$other_section" != "$section" && ( "$other_section" == "$section/"* || "$other_path" == "$submodule_path" ) ]]; then
-      error_echo "目标缓存与其它子模块登记重叠，拒绝删除：$section / $other_section"
+      error_echo "目标缓存与其它子模块登记重叠，拒绝复用：$section / $other_section"
       return 1
     fi
   done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$')
   worktree="$(git config --file "$cache_dir/config" --get core.worktree)" || {
-    error_echo "缓存缺少可核验的 core.worktree，拒绝删除：$cache_dir"
+    error_echo "缓存缺少可核验的 core.worktree，拒绝复用：$cache_dir"
     return 1
   }
   [[ "$worktree" == /* ]] || worktree="$cache_dir/$worktree"
   expected_worktree="$PWD/$submodule_path"
   if [[ "${worktree:A}" != "${expected_worktree:A}" ]]; then
-    error_echo "缓存属于其它工作目录，拒绝删除：$cache_dir"
+    error_echo "缓存属于其它工作目录，拒绝复用：$cache_dir"
     return 1
   fi
   if [[ -e "$submodule_path/.git" ]]; then
     actual_git_dir="$(git -C "$submodule_path" rev-parse --absolute-git-dir)" || return 1
     if [[ "${actual_git_dir:A}" != "$cache_dir" ]]; then
-      error_echo "当前子仓与候选缓存指向不同元数据，拒绝删除：$submodule_path"
+      error_echo "当前子仓与候选缓存指向不同元数据，拒绝复用：$submodule_path"
       return 1
     fi
   fi
   if [[ -d "$cache_dir/worktrees" && -n "$(ls -A "$cache_dir/worktrees")" ]]; then
-    error_echo "子模块缓存仍登记其它 worktree，拒绝删除：$cache_dir"
+    error_echo "子模块缓存仍登记其它 worktree，拒绝复用：$cache_dir"
     return 1
   fi
   printf '%s\n' "$cache_dir"
 }
-# 只删除已核验属于目标子仓的工作目录和真实 Git 缓存。
-remove_worktree_dir_safely() {
-  local submodule_path="$1" submodule_cache=""
-
-  if ! validate_local_path "$submodule_path" || [[ "$submodule_path" == .git || -L "$submodule_path" ]]; then
-    error_echo "拒绝删除危险路径或符号链接：$submodule_path"
+# 在空工作区重新连接已核验缓存，从索引恢复文件，保留提交、配置和暂存改动。
+restore_cached_submodule_worktree() {
+  local submodule_path="$1" cached_gitdir="$2" repo_root="${PWD}/$1"
+  if [[ -e "$submodule_path" ]] && ! is_dir_empty "$submodule_path"; then
+    error_echo "Git 缓存对应目录非空，拒绝覆盖：$repo_root"
     return 1
   fi
-
-  # 删除父目录会连同后代一起移除，即使只下载一层也必须保护后代改动。
-  if ! (
-    SUBMODULE_RECURSIVE=1
-    assert_clean_submodule "$submodule_path" "删除目录"
-  ); then
+  if [[ ! -f "$cached_gitdir/index" ]]; then
+    error_echo "子模块缓存缺少索引，保留并停止：$cached_gitdir；请先用 Git 恢复后重试。"
     return 1
   fi
-  submodule_cache="$(submodule_cache_for_removal "$submodule_path")" || return 1
-
-  if is_gitlink_registered "$submodule_path"; then
-    run_cmd git submodule deinit -f -- "$submodule_path" || return 1
+  info_echo "复用已有 Git 缓存恢复空工作区：$repo_root（缓存：$cached_gitdir）"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    note_echo "[DRY-RUN] 恢复 .git 指针与索引文件，不删除缓存：$repo_root"
+    return 0
   fi
-
-  if [[ -n "$submodule_cache" ]]; then
-    run_cmd rm -rf -- "$submodule_cache" || return 1
-    note_echo "已清理目标子模块缓存：$submodule_cache"
-  fi
-
-  if [[ -e "$submodule_path" ]]; then
-    if is_git_worktree "$submodule_path" || is_dir_empty "$submodule_path" || [[ "$FORCE_DELETE" == "1" ]]; then
-      run_cmd rm -rf "$submodule_path" || return 1
-      warn_echo "已删除目标目录：$submodule_path"
-    else
-      error_echo "发现非 Git 且非空目录，默认拒绝删除：$submodule_path；确认要删可设置 FORCE_DELETE=1"
-      return 1
-    fi
-  fi
-
-  # 注意：这里故意不删除 .gitmodules 段、不 git rm --cached。
-  # 全量同步只是刷新工作区目录；.gitmodules 由 reconcile_gitmodules_with_config_once 负责查漏补缺。
+  mkdir -p -- "$submodule_path" || return 1
+  printf 'gitdir: %s\n' "$cached_gitdir" > "$submodule_path/.git" || return 1
+  git -C "$submodule_path" -c submodule.recurse=false checkout-index --all || {
+    error_echo "缓存工作区恢复失败，已保留缓存和当前状态：$repo_root"
+    return 1
+  }
 }
 # 封装 clone_submodule_worktree 对应的独立处理逻辑。
 clone_submodule_worktree() {
@@ -1510,13 +1572,12 @@ clone_submodule_worktree() {
 ensure_submodule_worktree_present() {
   local submodule_path="$1"
   local url="${2:-}" preferred="${3:-$SUBMODULE_BRANCH}" stage_association="${4:-1}"
-  # 已有缓存必须先核验；缺少工作区时保留缓存，避免 clone 后吸收覆盖冲突。
+  # 已有缓存先核验并恢复空工作区，避免重新克隆或丢失历史。
   if [[ ! -e "$submodule_path/.git" ]]; then
     local cached_gitdir=""
     cached_gitdir="$(submodule_cache_for_removal "$submodule_path")" || return 1
     if [[ -n "$cached_gitdir" ]]; then
-      error_echo "子仓工作区缺失但 Git 缓存仍存在，已保留且停止：$cached_gitdir；请先用 Git 恢复该工作区，或选择全量重建。"
-      return 1
+      restore_cached_submodule_worktree "$submodule_path" "$cached_gitdir" || return 1
     fi
   fi
 
@@ -1526,7 +1587,8 @@ ensure_submodule_worktree_present() {
     if is_git_worktree "$submodule_path"; then
       assert_clean_submodule "$submodule_path" "纳入子模块" || return 1
     elif is_dir_empty "$submodule_path"; then
-      run_cmd rm -rf "$submodule_path" || return 1
+      info_echo "首次初始化空子仓目录：$PWD/$submodule_path"
+      run_cmd rmdir -- "$submodule_path" || return 1
     else
       error_echo "目标目录已存在且不是 Git 空目录，拒绝覆盖：$submodule_path"
       return 1
@@ -1752,55 +1814,12 @@ stage_and_commit_parent_changes() {
   run_cmd git --literal-pathspecs -c core.quotepath=false commit --only -m "chore: sync git submodules (${style})" -- "${add_targets[@]}" || return 1
   success_echo "父仓已提交 .gitmodules/gitlink 变化"
 }
-# 删除前展示精确清单并要求 YES；演练不触发破坏性确认。
-confirm_full_rebuild() {
-  [[ "$DRY_RUN" != 1 ]] || return 0
-  local target="" answer=""
-  warn_echo "全量模式会删除下列目标目录与对应子模块缓存，再按清单重建；本地独有提交可能丢失。"
-  while IFS= read -r target; do
-    [[ -z "$target" ]] || note_echo "全量重建目标：$target"
-  done < <(collect_full_delete_targets)
-  if [[ ! -t 0 ]]; then
-    error_echo "全量重建需要在交互终端输入 YES，未执行删除。"
-    return 1
-  fi
-  if ! IFS= read -r "answer?确认删除并重建以上目标？输入 YES 后回车执行；其它输入取消："; then
-    note_echo "输入已结束，已取消全量重建。"
-    return 1
-  fi
-  if [[ "$answer" != YES ]]; then
-    note_echo "未输入 YES，已取消全量重建。"
-    return 1
-  fi
-}
-# 确认后只重建脚本清单与对应旧仓名目录。
+# 全量遍历清单；已有子仓原地更新，空目录或缺失工作区按实际状态初始化。
 full_sync_to_latest() {
-  if ! confirm_full_rebuild; then
-    return 0
-  fi
-  info_echo "开始全量同步：先对 .gitmodules 做一次查漏补缺；再删除 SUBMODULE_REPO_URLS 配置的目标目录；最后按配置重建"
-
+  info_echo "开始全量同步：补齐 .gitmodules；已有子仓复用更新，空目录初始化；未提交内容逐仓确认"
   reconcile_gitmodules_with_config_once || return 1
-
-  local -a delete_targets
-  delete_targets=()
-  local p=""
-  while IFS= read -r p; do
-    [[ -n "$p" ]] && delete_targets+=("$p")
-  done < <(collect_full_delete_targets)
-
-  for p in "${delete_targets[@]}"; do
-    remove_worktree_dir_safely "$p" || return 1
-  done
-
-  local -a synced_paths
-  synced_paths=()
-  for p in "${CONFIG_PATHS[@]}"; do
-    synced_paths+=("$p")
-  done
-
-  sync_selected_submodules_to_latest "${synced_paths[@]}" || return 1
-  stage_and_commit_parent_changes "${synced_paths[@]}" || return 1
+  sync_selected_submodules_to_latest "${CONFIG_PATHS[@]}" || return 1
+  stage_and_commit_parent_changes "${CONFIG_PATHS[@]}" || return 1
   parent_push_if_needed || return 1
   success_echo "全量同步完成"
 }
@@ -2277,7 +2296,8 @@ show_script_intro_and_wait() {
   print -r -- '核心用途：按脚本清单下载、更新或添加 Git 子模块；默认向下逐层同步，可在菜单切换为仅直属一层。' | jobs_intro_style body
   print -r -- '递归边界：从运行脚本对应仓库向下，仅处理所选子树，各层读取自己的 .gitmodules；不向上处理。' | jobs_intro_style body
   print -r -- '影响范围：父仓登记和提交指针、子仓代码与分支；默认自动提交父仓，不自动推送。' | jobs_intro_style body
-  print -r -- '关键风险：更新会强制对齐远端；全量模式删除清单目标及对应旧仓名目录，必须另输入 YES。' | jobs_intro_style body
+  print -r -- '同步策略：全量按清单逐仓处理；已有子仓复用更新，空目录首次初始化，不删除已有子树或旧仓名目录。' | jobs_intro_style body
+  print -r -- '关键风险：分支会对齐远端最新；未提交内容红字加粗标明仓库，循环等待 YES 放弃当前仓改动，或在外部处理后按回车复检。' | jobs_intro_style body
   print -r -- "日志文件：$LOG_FILE" | jobs_intro_style body
   print -r -- '取消方式：按 Ctrl+C 终止；自述确认前不执行真实业务。' | jobs_intro_style body
   print -r -- '============================================================================' | jobs_intro_style title
