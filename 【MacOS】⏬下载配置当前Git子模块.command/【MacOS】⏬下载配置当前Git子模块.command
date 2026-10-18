@@ -3,11 +3,10 @@
 # - 脚本名称：【MacOS】⏬下载配置当前Git子模块.command
 # - 来源日志：克隆 / 拉取前突出平台与完整地址，完成时带来源，保留递归来源核对。
 # - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS，递归子模块继承，不写全局配置。
-# - 核心用途：执行“⏬下载配置当前Git子模块”对应的 Git / Sourcetree 自动化操作。
-# - 影响范围：可能修改当前仓库、工作区、分支、菜单配置或 Git 索引。
-# - 运行提示：运行后会先打印内置自述；终端模式按回车确认后继续，按 Ctrl+C 可取消。
+# - 核心用途：按各仓独立清单下载、更新和登记 Git 子模块，支持根目录或直属同名脚本目录。
+# - 影响范围：父仓登记、索引与提交，子仓工作区和分支；全量模式仅删除清单目标及对应旧仓名目录。
+# - 运行提示：先阅读内置自述并回车确认；全量重建另需 YES；Ctrl+C 取消，默认提交父仓但不推送。
 
-# 双击 .command 时 PATH 经常不完整；先补齐 macOS 基础路径和 Homebrew 路径。
 # 仅渲染自述：标题红色加粗，编号正文蓝色常规字重；非彩色终端输出纯文本。
 # >>> Jobs Homebrew install choice >>>
 # 输出安装诊断，避免混入返回的命令路径。
@@ -213,9 +212,6 @@ jobs_intro_style() {
     }
   '
 }
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
-export LANG="${LANG:-zh_CN.UTF-8}"
-export LC_CTYPE="${LC_CTYPE:-UTF-8}"
 
 # ============================== 用户只需要改这里：目标子 Git 列表 ==============================
 # 支持任意托管站点的 HTTPS、git@host:namespace/repo.git、ssh://git@host:端口/namespace/repo.git。
@@ -245,10 +241,11 @@ SUBMODULE_FETCH_TAGS="${SUBMODULE_FETCH_TAGS:-0}"          # 1=同步 tags；默
 
 # ============================== 脚本路径定位 ==============================
 SCRIPT_FILE="${(%):-%x}"
-SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_FILE")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
-SCRIPT_BASENAME="$(basename "$SCRIPT_FILE" | sed 's/\.[^.]*$//')"
-LOG_FILE="/tmp/${SCRIPT_BASENAME}.log"
+SCRIPT_DIR=""
+REPO_ROOT=""
+SCRIPT_BASENAME="【MacOS】⏬下载配置当前Git子模块"
+LOG_FILE="${TMPDIR:-/tmp}/${SCRIPT_BASENAME}.log"
+PREVIEW_FILE=""
 
 # ============================== 全局缓存 ==============================
 # entry 格式：local_path|page_url|https_clone_url|ssh_clone_url|repo_name
@@ -260,16 +257,17 @@ CONFIG_PATHS=()
 CONFIG_REPO_NAMES=()
 GITMODULES_RECONCILED=0
 # ============================== 输出工具 ==============================
+# 同步显示终端输出并记录本轮日志。
 log()          { printf '%s\n' "$1" | tee -a "$LOG_FILE"; }
-# 输出 info echo 对应级别的日志信息。
+# 按当前输出级别记录终端信息，并同步写入脚本日志。
 info_echo()    { log "ℹ️  $*"; }
-# 输出 success echo 对应级别的日志信息。
+# 按当前输出级别记录终端信息，并同步写入脚本日志。
 success_echo() { log "✅ $*"; }
-# 输出 warn echo 对应级别的日志信息。
+# 按当前输出级别记录终端信息，并同步写入脚本日志。
 warn_echo()    { log "⚠️  $*"; }
-# 输出 error echo 对应级别的日志信息。
+# 按当前输出级别记录终端信息，并同步写入脚本日志。
 error_echo()   { printf '%s\n' "❌ $*" >&2; printf '%s\n' "❌ $*" >> "$LOG_FILE"; }
-# 输出 note echo 对应级别的日志信息。
+# 按当前输出级别记录终端信息，并同步写入脚本日志。
 note_echo()    { log "📝 $*"; }
 
 # 来源重点只在交互终端着色，日志始终保存可直接搜索的纯文本。
@@ -331,7 +329,7 @@ print_git_source() {
   source_highlight_echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 }
 
-# 执行 run cmd 对应的独立业务步骤。
+# 执行已经拆分完成的独立业务步骤。
 run_cmd() {
   if [[ "$DRY_RUN" == "1" ]]; then
     note_echo "[DRY-RUN] $*"
@@ -339,11 +337,11 @@ run_cmd() {
     "$@"
   fi
 }
-# 封装 trim string 对应的独立处理逻辑。
+# 封装 trim_string 对应的独立处理逻辑。
 trim_string() {
   printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
-# 封装 preview safe text 对应的独立处理逻辑。
+# 封装 preview_safe_text 对应的独立处理逻辑。
 preview_safe_text() {
   # 只处理 fzf preview 展示层：去掉 U+FE0F，避免 macOS Terminal/fzf 对 emoji 宽度重绘错位。
   # 不改变真实目录名、.gitmodules、Git 子模块路径。
@@ -354,7 +352,7 @@ preview_safe_text() {
     printf '%s\n' "$s"
   fi
 }
-# 解析并返回 get ncpu 所需信息。
+# 解析并返回后续流程需要的目标信息。
 get_ncpu() {
   if command -v sysctl >/dev/null 2>&1; then
     sysctl -n hw.ncpu 2>/dev/null || echo 1
@@ -362,16 +360,16 @@ get_ncpu() {
     echo 1
   fi
 }
-# 解析并返回 get cpu arch 所需信息。
+# 解析并返回后续流程需要的目标信息。
 get_cpu_arch() {
   uname -m
 }
-# 封装 cd to script dir 对应的独立处理逻辑。
+# 封装 cd_to_script_dir 对应的独立处理逻辑。
 cd_to_script_dir() {
   cd "$REPO_ROOT"
   info_echo "当前工作目录已切换到目标仓库根目录：$(pwd)"
 }
-# 判断 contains item 对应条件是否成立。
+# 封装 contains_item 对应的独立处理逻辑。
 contains_item() {
   local needle="$1"
   shift || true
@@ -564,25 +562,25 @@ configured_git_url_by_path() {
   done
   repo_https_by_path "$target"
 }
-# 封装 entry path 对应的独立处理逻辑。
+# 封装 entry_path 对应的独立处理逻辑。
 entry_path() {
   local entry="$1"
   printf '%s\n' "${entry%%|*}"
 }
-# 封装 entry page 对应的独立处理逻辑。
+# 封装 entry_page 对应的独立处理逻辑。
 entry_page() {
   local entry="$1"
   local rest="${entry#*|}"
   printf '%s\n' "${rest%%|*}"
 }
-# 封装 entry https 对应的独立处理逻辑。
+# 封装 entry_https 对应的独立处理逻辑。
 entry_https() {
   local entry="$1"
   local rest="${entry#*|}"
   rest="${rest#*|}"
   printf '%s\n' "${rest%%|*}"
 }
-# 封装 entry ssh 对应的独立处理逻辑。
+# 封装 entry_ssh 对应的独立处理逻辑。
 entry_ssh() {
   local entry="$1"
   local rest="${entry#*|}"
@@ -590,7 +588,7 @@ entry_ssh() {
   rest="${rest#*|}"
   printf '%s\n' "${rest%%|*}"
 }
-# 封装 entry repo 对应的独立处理逻辑。
+# 封装 entry_repo 对应的独立处理逻辑。
 entry_repo() {
   local entry="$1"
   local rest="${entry#*|}"
@@ -599,7 +597,7 @@ entry_repo() {
   rest="${rest#*|}"
   printf '%s\n' "$rest"
 }
-# 解析并返回 get entry by path 所需信息。
+# 解析并返回后续流程需要的目标信息。
 get_entry_by_path() {
   local target="$1"
   local entry=""
@@ -613,31 +611,31 @@ get_entry_by_path() {
 
   return 1
 }
-# 封装 repo page by path 对应的独立处理逻辑。
+# 封装 repo_page_by_path 对应的独立处理逻辑。
 repo_page_by_path() {
   local entry=""
   entry="$(get_entry_by_path "$1")" || return 1
   entry_page "$entry"
 }
-# 封装 repo https by path 对应的独立处理逻辑。
+# 封装 repo_https_by_path 对应的独立处理逻辑。
 repo_https_by_path() {
   local entry=""
   entry="$(get_entry_by_path "$1")" || return 1
   entry_https "$entry"
 }
-# 封装 repo ssh by path 对应的独立处理逻辑。
+# 封装 repo_ssh_by_path 对应的独立处理逻辑。
 repo_ssh_by_path() {
   local entry=""
   entry="$(get_entry_by_path "$1")" || return 1
   entry_ssh "$entry"
 }
-# 封装 repo name by path 对应的独立处理逻辑。
+# 封装 repo_name_by_path 对应的独立处理逻辑。
 repo_name_by_path() {
   local entry=""
   entry="$(get_entry_by_path "$1")" || return 1
   entry_repo "$entry"
 }
-# 检查 validate local path 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 validate_local_path() {
   local local_path="$1"
 
@@ -647,7 +645,7 @@ validate_local_path() {
 
   return 0
 }
-# 解析并返回 load configured submodules 所需信息。
+# 封装 load_configured_submodules 对应的独立处理逻辑。
 load_configured_submodules() {
   SUBMODULE_ENTRIES=()
   CONFIG_PATHS=()
@@ -697,7 +695,7 @@ load_configured_submodules() {
     CONFIG_REPO_NAMES+=("$repo_name")
   done
 }
-# 封装 append runtime submodule 对应的独立处理逻辑。
+# 封装 append_runtime_submodule 对应的独立处理逻辑。
 append_runtime_submodule() {
   local page_url="$1"
   local https_url="$2"
@@ -722,10 +720,11 @@ append_runtime_submodule() {
   GITMODULES_RECONCILED=0
 }
 # ============================== Homebrew / fzf 自检 ==============================
+# 查找已验证可运行的 Homebrew，避免重复安装。
 find_brew_bin() {
   jobs_brew_find
 }
-# 封装 inject shellenv block 对应的独立处理逻辑。
+# 封装 inject_shellenv_block 对应的独立处理逻辑。
 inject_shellenv_block() {
   local profile_file="$1"
   local shellenv="$2"
@@ -759,11 +758,11 @@ inject_shellenv_block() {
     eval "$shellenv"
   fi
 }
-# 准备并配置 install homebrew 对应的运行条件。
+# 执行对应的环境配置或同步处理。
 install_homebrew() {
   jobs_brew_install_or_exit # 只在真正安装时选择路径；演练模式不安装。
 }
-# 检查 ensure homebrew healthy 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 ensure_homebrew_healthy() {
   local jobs_existing_brew=""
   if jobs_existing_brew="$(jobs_brew_find)"; then
@@ -810,7 +809,7 @@ ensure_homebrew_healthy() {
     note_echo "已跳过 Homebrew 更新"
   fi
 }
-# 检查 ensure fzf healthy 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 ensure_fzf_healthy() {
   if command -v fzf >/dev/null 2>&1 && fzf --version >/dev/null 2>&1; then
     success_echo "fzf 自检通过：$(fzf --version | head -n 1)"
@@ -840,6 +839,7 @@ ensure_fzf_healthy() {
   fi
 }
 # ============================== 父仓协议与基础操作 ==============================
+# 验证当前目录就是父仓根目录，拒绝错误层级和隐式初始化。
 ensure_repo_initialized() {
   local git_root=""
   local current_root=""
@@ -860,7 +860,7 @@ ensure_repo_initialized() {
   run_cmd git config core.quotepath false || true
   git -c core.quotepath=false status >/dev/null
 }
-# 检查 ensure git remote 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 ensure_git_remote() {
   local remote_name="${1:-$REMOTE_NAME}"
 
@@ -893,7 +893,7 @@ ensure_git_remote() {
     error_echo "无法访问父仓远端：$remote_url"
   done
 }
-# 解析并返回 detect git url style 所需信息。
+# 解析并返回后续流程需要的目标信息。
 detect_git_url_style() {
   if [[ "$GIT_URL_STYLE" == "ssh" || "$GIT_URL_STYLE" == "https" ]]; then
     printf '%s\n' "$GIT_URL_STYLE"
@@ -909,7 +909,6 @@ detect_git_url_style() {
     *) printf '%s\n' "https" ;;
   esac
 }
-# 封装 clone url for path 对应的独立处理逻辑。
 # 相对 URL 完整跟随所选父 remote，明确绝对 URL 保留其平台和 namespace。
 clone_url_for_path() {
   local submodule_path="$1" url="" parent_url=""
@@ -940,6 +939,7 @@ validate_submodule_url_path() {
     [[ "${child_git_root:A}" == "$child_root" ]] || return 1
   fi
 }
+# 逐层解析实际下载地址，同步本地配置并按需核对来源。
 sync_submodule_urls_at_repo() {
   local repo_root="$1" parent_url="$2" key="" section="" submodule_path="" url="" child_root=""
   local show_sources="${3:-0}" source_repo="" source_scope=""
@@ -980,11 +980,11 @@ sync_submodule_urls_for_remote() {
   repo_root="$(git rev-parse --show-toplevel)" || return 1
   sync_submodule_urls_at_repo "$repo_root" "$parent_url"
 }
-# 封装 parent has uncommitted changes 对应的独立处理逻辑。
+# 封装 parent_has_uncommitted_changes 对应的独立处理逻辑。
 parent_has_uncommitted_changes() {
   [[ -n "$(git -c core.quotepath=false status --porcelain)" ]]
 }
-# 检查 ensure parent branch 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 ensure_parent_branch() {
   local b="$SUBMODULE_BRANCH"
   local current=""
@@ -1006,7 +1006,7 @@ ensure_parent_branch() {
     run_cmd git -c core.quotepath=false checkout -B "$b"
   fi
 }
-# 封装 parent pull rebase 对应的独立处理逻辑。
+# 封装 parent_pull_rebase 对应的独立处理逻辑。
 parent_pull_rebase() {
   local b=""
   b="$(git rev-parse --abbrev-ref HEAD)"
@@ -1022,7 +1022,7 @@ parent_pull_rebase() {
     run_cmd git pull --rebase "$REMOTE_NAME" "$b" || warn_echo "父仓 pull --rebase 未完成，请检查是否存在冲突；本次继续处理子模块"
   fi
 }
-# 封装 parent push if needed 对应的独立处理逻辑。
+# 封装 parent_push_if_needed 对应的独立处理逻辑。
 parent_push_if_needed() {
   if [[ "$AUTO_PARENT_PUSH" != "1" ]]; then
     note_echo "AUTO_PARENT_PUSH=0，已跳过父仓 push"
@@ -1034,6 +1034,7 @@ parent_push_if_needed() {
   run_cmd git push -u "$REMOTE_NAME" "$b"
 }
 # ============================== 分支探测 ==============================
+# 从远端 HEAD 读取默认分支，不创建或改名本地分支。
 remote_default_branch_by_url() {
   local url="$1"
   local branch=""
@@ -1041,13 +1042,13 @@ remote_default_branch_by_url() {
   branch="$(git ls-remote --symref "$url" HEAD 2>/dev/null | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2; exit }' || true)"
   [[ -n "$branch" ]] && printf '%s\n' "$branch"
 }
-# 封装 remote branch exists 对应的独立处理逻辑。
+# 封装 remote_branch_exists 对应的独立处理逻辑。
 remote_branch_exists() {
   local url="$1"
   local branch="$2"
   git ls-remote --exit-code --heads "$url" "$branch" >/dev/null 2>&1
 }
-# 封装 remote branch for url 对应的独立处理逻辑。
+# 封装 remote_branch_for_url 对应的独立处理逻辑。
 remote_branch_for_url() {
   local url="$1"
   local preferred="$2"
@@ -1067,17 +1068,18 @@ remote_branch_for_url() {
   printf '%s\n' "$preferred"
 }
 # ============================== 子模块状态判断 ==============================
+# 判断目标是否为可用的 Git 工作区。
 is_git_worktree() {
   local submodule_path="$1"
   [[ -e "$submodule_path/.git" ]] || return 1
   git -C "$submodule_path" rev-parse --is-inside-work-tree >/dev/null 2>&1
 }
-# 判断 is gitlink registered 对应条件是否成立。
+# 检查当前运行条件是否满足后续流程要求。
 is_gitlink_registered() {
   local submodule_path="$1"
   git ls-files --stage -- "$submodule_path" 2>/dev/null | awk '{ if ($1 == "160000") found=1 } END { exit found ? 0 : 1 }'
 }
-# 判断 is dir empty 对应条件是否成立。
+# 检查当前运行条件是否满足后续流程要求。
 is_dir_empty() {
   local submodule_path="$1"
   [[ -d "$submodule_path" ]] || return 1
@@ -1085,7 +1087,7 @@ is_dir_empty() {
   entries=("$submodule_path"/*(DN))
   [[ ${#entries} -eq 0 ]]
 }
-# 检查 assert clean submodule 所需条件，不满足时阻止继续执行。
+# 封装 assert_clean_submodule 对应的独立处理逻辑。
 assert_clean_submodule() {
   local submodule_path="$1"
   local action="$2"
@@ -1105,6 +1107,7 @@ assert_clean_submodule() {
   return 0
 }
 # ============================== .gitmodules 查漏补缺 ==============================
+# 保留已有共享登记文件，缺失时才建立空文件。
 ensure_gitmodules_file_exists() {
   if [[ -f .gitmodules ]]; then
     return 0
@@ -1113,7 +1116,7 @@ ensure_gitmodules_file_exists() {
   run_cmd touch .gitmodules
   warn_echo ".gitmodules 当前不存在，已按 SUBMODULE_REPO_URLS 重建空文件，后续会逐项查漏补缺"
 }
-# 解析并返回 find gitmodules section by path 所需信息。
+# 解析并返回后续流程需要的目标信息。
 find_gitmodules_section_by_path() {
   local target_path="$1"
   [[ -f .gitmodules ]] || return 1
@@ -1133,7 +1136,7 @@ find_gitmodules_section_by_path() {
 
   return 1
 }
-# 解析并返回 collect gitmodules paths 所需信息。
+# 封装 collect_gitmodules_paths 对应的独立处理逻辑。
 collect_gitmodules_paths() {
   [[ -f .gitmodules ]] || return 0
 
@@ -1142,8 +1145,6 @@ collect_gitmodules_paths() {
     git config -f .gitmodules --get "$key" 2>/dev/null || true
   done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null || true)
 }
-# 封装 gitmodules preferred style 对应的独立处理逻辑。
-# 封装 gitmodules url for path 对应的独立处理逻辑。
 # 已知镜像仓名不同时保留明确绝对地址，不把当前平台仓名传播到其它平台。
 submodule_has_consistent_remote_names() {
   local submodule_path="$1" expected_name="$2" remote_name="" remote_url="" remote_repo=""
@@ -1213,8 +1214,7 @@ repo_name_from_git_url() {
   parsed="$(parse_git_remote_url "$1")" || return 1
   printf '%s\n' "${parsed##*|}"
 }
-# 封装 gitmodules url points to config repo 对应的独立处理逻辑。
-# 清理 remove gitmodules entry by path 对应的目标内容。
+# 执行对应的清理操作，并保留必要的安全检查。
 remove_gitmodules_entry_by_path() {
   local submodule_path="$1"
   local section=""
@@ -1226,7 +1226,7 @@ remove_gitmodules_entry_by_path() {
     note_echo "已移除 .gitmodules 旧配置段：submodule.$section"
   fi
 }
-# 检查 ensure gitmodules entry 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 # 增量补齐缺项，保留已有 URL、分支与扩展字段。
 ensure_gitmodules_entry() {
   local submodule_path="$1" section="" desired_url="${2:-}" new_section=0
@@ -1267,7 +1267,7 @@ ensure_gitmodules_entry() {
     info_echo ".gitmodules 已存在，保留 URL、分支与扩展字段：$submodule_path"
   fi
 }
-# 封装 prune unconfigured gitmodules 对应的独立处理逻辑。
+# 封装 prune_unconfigured_gitmodules 对应的独立处理逻辑。
 prune_unconfigured_gitmodules() {
   [[ "$PRUNE_STALE_GITMODULES" == "1" ]] || return 0
   [[ -f .gitmodules ]] || return 0
@@ -1288,7 +1288,7 @@ prune_unconfigured_gitmodules() {
 
       if [[ -d "$existing_path" ]]; then
         if is_git_worktree "$existing_path" || is_dir_empty "$existing_path" || [[ "$FORCE_DELETE" == "1" ]]; then
-          run_cmd rm -rf "$existing_path"
+          run_cmd rm -rf "$existing_path" || return 1
           warn_echo "已删除旧子模块目录：$existing_path"
         else
           error_echo "旧子模块目录不是 Git 且非空，默认拒绝删除：$existing_path；确认要删可设置 FORCE_DELETE=1"
@@ -1298,25 +1298,26 @@ prune_unconfigured_gitmodules() {
     fi
   done < <(collect_gitmodules_paths)
 }
-# 封装 reconcile gitmodules with config once 对应的独立处理逻辑。
+# 封装 reconcile_gitmodules_with_config_once 对应的独立处理逻辑。
 reconcile_gitmodules_with_config_once() {
   if [[ "$GITMODULES_RECONCILED" == "1" ]]; then
     info_echo ".gitmodules 本轮已完成查漏补缺，跳过重复自检"
     return 0
   fi
 
-  ensure_gitmodules_file_exists
+  ensure_gitmodules_file_exists || return 1
 
   local p=""
   for p in "${CONFIG_PATHS[@]}"; do
     ensure_gitmodules_entry "$p" || return 1
   done
 
-  prune_unconfigured_gitmodules
+  prune_unconfigured_gitmodules || return 1
   GITMODULES_RECONCILED=1
   success_echo ".gitmodules 查漏补缺完成"
 }
 # ============================== 子模块目录清理/添加/同步 ==============================
+# 按输入顺序去重目录，避免重复处理目标。
 unique_paths_from_stdin() {
   local -a result
   result=()
@@ -1333,7 +1334,7 @@ unique_paths_from_stdin() {
     printf '%s\n' "$p"
   done
 }
-# 解析并返回 collect full delete targets 所需信息。
+# 封装 collect_full_delete_targets 对应的独立处理逻辑。
 collect_full_delete_targets() {
   {
     local p=""
@@ -1343,24 +1344,89 @@ collect_full_delete_targets() {
     done
   } | unique_paths_from_stdin
 }
-# 清理 remove worktree dir safely 对应的目标内容。
+# 按真实 section 定位目标缓存，删除前核验边界、工作区归属和独立引用。
+submodule_cache_for_removal() {
+  local submodule_path="$1" section="" parent_git_dir="" modules_root="" cache_dir=""
+  local worktree="" expected_worktree="" actual_git_dir="" key="" other_section="" other_path=""
+  section="$(find_gitmodules_section_by_path "$submodule_path" || true)"
+  if [[ -z "$section" ]]; then
+    if [[ -f "$submodule_path/.git" ]] || is_gitlink_registered "$submodule_path"; then
+      error_echo "缺少明确的子模块登记，无法安全定位 Git 缓存：$submodule_path"
+      return 1
+    fi
+    return 0
+  fi
+  if [[ "$section" == /* || "$section" == */ || "$section" == *//* || "$section" == *$'\n'* || "$section" == *$'\r'* ]]; then
+    error_echo "子模块 section 不是安全的相对缓存路径：$section"
+    return 1
+  fi
+  local component=""
+  for component in "${(@s:/:)section}"; do
+    if [[ -z "$component" || "$component" == . || "$component" == .. ]]; then
+      error_echo "子模块 section 包含越界路径：$section"
+      return 1
+    fi
+  done
+  parent_git_dir="$(git rev-parse --absolute-git-dir)" || return 1
+  parent_git_dir="${parent_git_dir:A}"
+  modules_root="$parent_git_dir/modules"
+  cache_dir="$modules_root/$section"
+  [[ -e "$cache_dir" || -L "$cache_dir" ]] || return 0
+  if [[ ! -d "$cache_dir" || -L "$modules_root" || "${cache_dir:A}" != "$cache_dir" ]]; then
+    error_echo "子模块缓存不是父仓 modules 下的普通目录，拒绝删除：$cache_dir"
+    return 1
+  fi
+  while IFS= read -r key; do
+    other_section="${key#submodule.}"
+    other_section="${other_section%.path}"
+    other_path="$(git config -f .gitmodules --get "$key")" || return 1
+    if [[ "$other_section" != "$section" && ( "$other_section" == "$section/"* || "$other_path" == "$submodule_path" ) ]]; then
+      error_echo "目标缓存与其它子模块登记重叠，拒绝删除：$section / $other_section"
+      return 1
+    fi
+  done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$')
+  worktree="$(git config --file "$cache_dir/config" --get core.worktree)" || {
+    error_echo "缓存缺少可核验的 core.worktree，拒绝删除：$cache_dir"
+    return 1
+  }
+  [[ "$worktree" == /* ]] || worktree="$cache_dir/$worktree"
+  expected_worktree="$PWD/$submodule_path"
+  if [[ "${worktree:A}" != "${expected_worktree:A}" ]]; then
+    error_echo "缓存属于其它工作目录，拒绝删除：$cache_dir"
+    return 1
+  fi
+  if [[ -e "$submodule_path/.git" ]]; then
+    actual_git_dir="$(git -C "$submodule_path" rev-parse --absolute-git-dir)" || return 1
+    if [[ "${actual_git_dir:A}" != "$cache_dir" ]]; then
+      error_echo "当前子仓与候选缓存指向不同元数据，拒绝删除：$submodule_path"
+      return 1
+    fi
+  fi
+  if [[ -d "$cache_dir/worktrees" && -n "$(ls -A "$cache_dir/worktrees")" ]]; then
+    error_echo "子模块缓存仍登记其它 worktree，拒绝删除：$cache_dir"
+    return 1
+  fi
+  printf '%s\n' "$cache_dir"
+}
+# 只删除已核验属于目标子仓的工作目录和真实 Git 缓存。
 remove_worktree_dir_safely() {
-  local submodule_path="$1"
+  local submodule_path="$1" submodule_cache=""
 
-  if [[ -z "$submodule_path" || "$submodule_path" == "." || "$submodule_path" == "/" || "$submodule_path" == ".." ]]; then
-    error_echo "拒绝删除危险路径：$submodule_path"
+  if ! validate_local_path "$submodule_path" || [[ "$submodule_path" == .git || -L "$submodule_path" ]]; then
+    error_echo "拒绝删除危险路径或符号链接：$submodule_path"
     return 1
   fi
 
   assert_clean_submodule "$submodule_path" "删除目录" || return 1
+  submodule_cache="$(submodule_cache_for_removal "$submodule_path")" || return 1
 
   if is_gitlink_registered "$submodule_path"; then
-    run_cmd git submodule deinit -f -- "$submodule_path" >/dev/null 2>&1 || true
+    run_cmd git submodule deinit -f -- "$submodule_path" || return 1
   fi
 
-  if [[ -d ".git/modules/$submodule_path" ]]; then
-    run_cmd rm -rf ".git/modules/$submodule_path"
-    note_echo "已清理旧子模块缓存：.git/modules/$submodule_path"
+  if [[ -n "$submodule_cache" ]]; then
+    run_cmd rm -rf -- "$submodule_cache" || return 1
+    note_echo "已清理目标子模块缓存：$submodule_cache"
   fi
 
   if [[ -e "$submodule_path" ]]; then
@@ -1376,14 +1442,14 @@ remove_worktree_dir_safely() {
   # 注意：这里故意不删除 .gitmodules 段、不 git rm --cached。
   # 全量同步只是刷新工作区目录；.gitmodules 由 reconcile_gitmodules_with_config_once 负责查漏补缺。
 }
-# 封装 clone submodule worktree 对应的独立处理逻辑。
+# 封装 clone_submodule_worktree 对应的独立处理逻辑。
 clone_submodule_worktree() {
   local submodule_path="$1"
   local url=""
   url="$(clone_url_for_path "$submodule_path")" || return 1
   print_git_source "首次克隆" "$submodule_path" "$PWD" "$url" clone
   local branch=""
-  branch="$(remote_branch_for_url "$url" "$SUBMODULE_BRANCH")"
+  branch="$(remote_branch_for_url "$url" "$SUBMODULE_BRANCH")" || return 1
 
   local -a clone_args
   clone_args=()
@@ -1409,7 +1475,7 @@ clone_submodule_worktree() {
     run_cmd git -C "$submodule_path" config remote.origin.tagOpt --no-tags || true
   fi
 }
-# 检查 ensure submodule worktree present 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 ensure_submodule_worktree_present() {
   local submodule_path="$1"
 
@@ -1435,16 +1501,22 @@ ensure_submodule_worktree_present() {
 
   # 标准子模块形态：子仓目录里保留 .git 单文件，真正 Git 数据放到父仓 .git/modules 下。
   # 这一步不决定是否浅克隆；浅克隆由 --depth 控制。这里负责把 .git 文件夹吸收到父仓管理。
-  run_cmd git submodule absorbgitdirs -- "$submodule_path" >/dev/null 2>&1 || true
+  if ! run_cmd git submodule absorbgitdirs -- "$submodule_path"; then
+    error_echo "子模块元数据归集失败：$submodule_path；未标记为完成。"
+    return 1
+  fi
   run_cmd git add -- .gitmodules "$submodule_path" || return 1
 
-  if [[ -f "$submodule_path/.git" ]]; then
+  if [[ "$DRY_RUN" == 1 ]]; then
+    note_echo "[DRY-RUN] 已计划登记并归集子模块：$submodule_path"
+  elif [[ -f "$submodule_path/.git" ]]; then
     success_echo "已登记标准子模块 gitlink：$submodule_path（子仓 .git 为单文件）"
   else
-    warn_echo "已登记子模块 gitlink：$submodule_path；但 .git 仍不是单文件，后续可再次执行 git submodule absorbgitdirs 修复"
+    error_echo "子模块元数据未形成标准 .git 指针：$submodule_path；未标记为完成。"
+    return 1
   fi
 }
-# 解析并返回 resolve remote branch for submodule 所需信息。
+# 解析并返回后续流程需要的目标信息。
 resolve_remote_branch_for_submodule() {
   local submodule_path="$1"
   local preferred="$SUBMODULE_BRANCH"
@@ -1463,7 +1535,7 @@ resolve_remote_branch_for_submodule() {
 
   return 1
 }
-# 更新并同步 sync one submodule to latest 对应的目标状态。
+# 执行对应的环境配置或同步处理。
 sync_one_submodule_to_latest() {
   local submodule_path="$1"
   local url=""
@@ -1524,11 +1596,14 @@ sync_one_submodule_to_latest() {
   fi
 
   # 再次确保子仓是标准 submodule 形态：工作目录下 .git 为单文件，Git 数据由父仓 .git/modules 托管。
-  run_cmd git submodule absorbgitdirs -- "$submodule_path" >/dev/null 2>&1 || true
+  if ! run_cmd git submodule absorbgitdirs -- "$submodule_path"; then
+    error_echo "子模块元数据归集失败：$submodule_path；未标记为完成。"
+    return 1
+  fi
 
   success_echo "$submodule_path 已浅同步到 origin/$branch：$(git -C "$submodule_path" rev-parse --short HEAD)（来源：$(safe_git_source_url "$(effective_git_source_url "$PWD/$submodule_path" "$url")")）"
 }
-# 更新并同步 sync selected submodules to latest 对应的目标状态。
+# 执行对应的环境配置或同步处理。
 sync_selected_submodules_to_latest() {
   local -a paths
   paths=("$@")
@@ -1544,7 +1619,7 @@ sync_selected_submodules_to_latest() {
     sync_one_submodule_to_latest "$p" || return 1
   done
 }
-# 封装 stage and commit parent changes 对应的独立处理逻辑。
+# 封装 stage_and_commit_parent_changes 对应的独立处理逻辑。
 stage_and_commit_parent_changes() {
   if [[ "$AUTO_PARENT_COMMIT" != "1" ]]; then
     note_echo "AUTO_PARENT_COMMIT=0，已跳过父仓提交"
@@ -1568,7 +1643,7 @@ stage_and_commit_parent_changes() {
     return 0
   fi
 
-  run_cmd git add -A -- "${add_targets[@]}" >/dev/null 2>&1 || true
+  run_cmd git add -A -- "${add_targets[@]}" || return 1
 
   if git diff --cached --quiet -- "${add_targets[@]}"; then
     info_echo "父仓 .gitmodules/gitlink 无变化，跳过提交"
@@ -1577,14 +1652,38 @@ stage_and_commit_parent_changes() {
 
   local style=""
   style="$(detect_git_url_style)"
-  run_cmd git -c core.quotepath=false commit -m "chore: sync git submodules (${style})"
+  run_cmd git --literal-pathspecs -c core.quotepath=false commit --only -m "chore: sync git submodules (${style})" -- "${add_targets[@]}" || return 1
   success_echo "父仓已提交 .gitmodules/gitlink 变化"
 }
-# ============================== 三种菜单动作 ==============================
+# 删除前展示精确清单并要求 YES；演练不触发破坏性确认。
+confirm_full_rebuild() {
+  [[ "$DRY_RUN" != 1 ]] || return 0
+  local target="" answer=""
+  warn_echo "全量模式会删除下列目标目录与对应子模块缓存，再按清单重建；本地独有提交可能丢失。"
+  while IFS= read -r target; do
+    [[ -z "$target" ]] || note_echo "全量重建目标：$target"
+  done < <(collect_full_delete_targets)
+  if [[ ! -t 0 ]]; then
+    error_echo "全量重建需要在交互终端输入 YES，未执行删除。"
+    return 1
+  fi
+  if ! IFS= read -r "answer?确认删除并重建以上目标？输入 YES 后回车执行；其它输入取消："; then
+    note_echo "输入已结束，已取消全量重建。"
+    return 1
+  fi
+  if [[ "$answer" != YES ]]; then
+    note_echo "未输入 YES，已取消全量重建。"
+    return 1
+  fi
+}
+# 确认后只重建脚本清单与对应旧仓名目录。
 full_sync_to_latest() {
+  if ! confirm_full_rebuild; then
+    return 0
+  fi
   info_echo "开始全量同步：先对 .gitmodules 做一次查漏补缺；再删除 SUBMODULE_REPO_URLS 配置的目标目录；最后按配置重建"
 
-  reconcile_gitmodules_with_config_once
+  reconcile_gitmodules_with_config_once || return 1
 
   local -a delete_targets
   delete_targets=()
@@ -1594,7 +1693,7 @@ full_sync_to_latest() {
   done < <(collect_full_delete_targets)
 
   for p in "${delete_targets[@]}"; do
-    remove_worktree_dir_safely "$p"
+    remove_worktree_dir_safely "$p" || return 1
   done
 
   local -a synced_paths
@@ -1605,11 +1704,11 @@ full_sync_to_latest() {
 
   sync_selected_submodules_to_latest "${synced_paths[@]}" || return 1
   sync_submodule_urls_for_remote || return 1
-  stage_and_commit_parent_changes "${synced_paths[@]}"
-  parent_push_if_needed
+  stage_and_commit_parent_changes "${synced_paths[@]}" || return 1
+  parent_push_if_needed || return 1
   success_echo "全量同步完成"
 }
-# 解析并返回 collect existing configured git paths 所需信息。
+# 封装 collect_existing_configured_git_paths 对应的独立处理逻辑。
 collect_existing_configured_git_paths() {
   local p=""
   for p in "${CONFIG_PATHS[@]}"; do
@@ -1618,7 +1717,7 @@ collect_existing_configured_git_paths() {
     fi
   done
 }
-# 更新并同步 update existing to latest 对应的目标状态。
+# 执行对应的环境配置或同步处理。
 update_existing_to_latest() {
   local -a existing_paths
   existing_paths=()
@@ -1630,19 +1729,19 @@ update_existing_to_latest() {
 
   if [[ ${#existing_paths} -eq 0 ]]; then
     warn_echo "当前不存在任何已配置的本地 Git 子目录，自动切换为全量同步"
-    full_sync_to_latest
+    full_sync_to_latest || return 1
     return 0
   fi
 
-  reconcile_gitmodules_with_config_once
+  reconcile_gitmodules_with_config_once || return 1
   info_echo "只同步当前已有的子 Git 目录：${existing_paths[*]}"
   sync_selected_submodules_to_latest "${existing_paths[@]}" || return 1
   sync_submodule_urls_for_remote || return 1
-  stage_and_commit_parent_changes "${existing_paths[@]}"
-  parent_push_if_needed
+  stage_and_commit_parent_changes "${existing_paths[@]}" || return 1
+  parent_push_if_needed || return 1
   success_echo "已有子模块同步完成"
 }
-# 检查 validate remote access or loop continue 所需条件，不满足时阻止继续执行。
+# 检查当前运行条件是否满足后续流程要求。
 validate_remote_access_or_loop_continue() {
   local url="$1"
   if git ls-remote "$url" >/dev/null 2>&1; then
@@ -1652,7 +1751,7 @@ validate_remote_access_or_loop_continue() {
   error_echo "Git 地址格式正确，但当前无法访问：$url"
   return 1
 }
-# 封装 add new git url interactive 对应的独立处理逻辑。
+# 封装 add_new_git_url_interactive 对应的独立处理逻辑。
 add_new_git_url_interactive() {
   while true; do
     echo ""
@@ -1700,8 +1799,8 @@ add_new_git_url_interactive() {
     GITMODULES_RECONCILED=1
     sync_selected_submodules_to_latest "$local_path" || return 1
     sync_submodule_urls_for_remote || return 1
-    stage_and_commit_parent_changes "$local_path"
-    parent_push_if_needed
+    stage_and_commit_parent_changes "$local_path" || return 1
+    parent_push_if_needed || return 1
 
     success_echo "已添加并同步新子模块：$local_path -> $clone_url"
     echo ""
@@ -1714,7 +1813,7 @@ add_new_git_url_interactive() {
     return 0
   done
 }
-# 执行 build submodule picker content 对应的独立业务步骤。
+# 封装 build_submodule_picker_content 对应的独立处理逻辑。
 build_submodule_picker_content() {
   local style=""
   style="$(detect_git_url_style 2>/dev/null || echo https)"
@@ -1739,7 +1838,7 @@ build_submodule_picker_content() {
 ------------------------------------------------------------
 EOF2
 }
-# 封装 submodule picker all selected 对应的独立处理逻辑。
+# 封装 submodule_picker_all_selected 对应的独立处理逻辑。
 submodule_picker_all_selected() {
   local p=""
 
@@ -1751,7 +1850,7 @@ submodule_picker_all_selected() {
 
   return 0
 }
-# 输出 render submodule keyboard picker 对应的说明与结果。
+# 封装 render_submodule_keyboard_picker 对应的独立处理逻辑。
 render_submodule_keyboard_picker() {
   local cursor="$1"
   local message="${2:-}"
@@ -1805,7 +1904,7 @@ render_submodule_keyboard_picker() {
   printf '%s\n' '操作：↑/↓ 移动，回车(Enter) 勾选/取消，← 返回上一页'
   printf '%s\n' '👉 最后按【空格键 Space】确认已勾选项目并开始同步（无需再按回车）。'
 }
-# 解析并返回 read submodule picker key 所需信息。
+# 封装 read_submodule_picker_key 对应的独立处理逻辑。
 read_submodule_picker_key() {
   local key=""
   local rest=""
@@ -1829,7 +1928,7 @@ read_submodule_picker_key() {
 
   SUBMODULE_PICKER_KEY="$key"
 }
-# 封装 select configured submodules interactive 对应的独立处理逻辑。
+# 收集并校验用户输入，决定后续执行路径。
 select_configured_submodules_interactive() {
   local preview_file="$1"
 
@@ -1903,12 +2002,12 @@ select_configured_submodules_interactive() {
         fi
 
         command clear 2>/dev/null || printf '\033[2J\033[H'
-        reconcile_gitmodules_with_config_once
+        reconcile_gitmodules_with_config_once || return 1
         info_echo "开始同步已选择的子模块：${selected_paths[*]}"
         sync_selected_submodules_to_latest "${selected_paths[@]}" || return 1
         sync_submodule_urls_for_remote || return 1
-        stage_and_commit_parent_changes "${selected_paths[@]}"
-        parent_push_if_needed
+        stage_and_commit_parent_changes "${selected_paths[@]}" || return 1
+        parent_push_if_needed || return 1
         success_echo "已选择子模块同步完成"
         return 0
         ;;
@@ -1927,6 +2026,7 @@ select_configured_submodules_interactive() {
   done
 }
 # ============================== fzf 菜单 ==============================
+# 展示主菜单并返回用户选中的同步动作。
 select_menu_action() {
   local preview_file="$1"
   local selected=""
@@ -1949,7 +2049,7 @@ select_menu_action() {
 
   printf '%s\n' "$selected"
 }
-# 执行 build intro content 对应的独立业务步骤。
+# 展示脚本用途和影响范围，并在执行前等待用户确认。
 build_intro_content() {
   local style=""
   style="$(detect_git_url_style 2>/dev/null || echo https)"
@@ -2003,7 +2103,7 @@ EOF2
 ------------------------------------------------------------
 EOF2
 }
-# 封装 main menu loop 对应的独立处理逻辑。
+# 封装 main_menu_loop 对应的独立处理逻辑。
 main_menu_loop() {
   local preview_file="$1"
 
@@ -2018,12 +2118,12 @@ main_menu_loop() {
 
     case "$action" in
       "全量同步更新下载到最新")
-        full_sync_to_latest
+        full_sync_to_latest || return 1
         return 0
         ;;
       "选择指定子模块同步（可多选）")
-        select_configured_submodules_interactive "$preview_file"
-        local result="$?"
+        local result=0
+        select_configured_submodules_interactive "$preview_file" || result="$?"
         if [[ "$result" == "0" ]]; then
           return 0
         elif [[ "$result" == "2" ]]; then
@@ -2033,11 +2133,11 @@ main_menu_loop() {
         fi
         ;;
       "只更新目前已有的")
-        update_existing_to_latest
+        update_existing_to_latest || return 1
         return 0
         ;;
       "添加并同步一个新的 Git 地址")
-        add_new_git_url_interactive
+        add_new_git_url_interactive || return 1
         ;;
       "退出")
         note_echo "已退出"
@@ -2049,73 +2149,81 @@ main_menu_loop() {
     esac
   done
 }
-# 展示脚本内置自述，并等待用户确认后执行。
+# 打印脚本内置自述，并按运行入口决定是否等待用户确认。
 show_script_intro_and_wait() {
   print -r -- '============================== 脚本内置自述 ==============================' | jobs_intro_style title
   print -r -- '脚本名称：【MacOS】⏬下载配置当前Git子模块.command' | jobs_intro_style title
-  print -r -- '核心用途：执行“⏬下载配置当前Git子模块”对应的 Git 自动化操作。' | jobs_intro_style body
-  print -r -- '影响范围：可能修改当前仓库、工作区、分支或 Git 索引。' | jobs_intro_style body
-  print -r -- '取消方式：确认前按 Ctrl+C 终止，不会继续执行后续业务。' | jobs_intro_style body
+  print -r -- '核心用途：按脚本清单下载、更新或添加父仓的 Git 子模块。' | jobs_intro_style body
+  print -r -- '影响范围：父仓登记和提交指针、子仓代码与分支；默认自动提交父仓，不自动推送。' | jobs_intro_style body
+  print -r -- '关键风险：更新会强制对齐远端；全量模式删除清单目标及对应旧仓名目录，必须另输入 YES。' | jobs_intro_style body
+  print -r -- "日志文件：$LOG_FILE" | jobs_intro_style body
+  print -r -- '取消方式：按 Ctrl+C 终止；自述确认前不执行真实业务。' | jobs_intro_style body
   print -r -- '============================================================================' | jobs_intro_style title
-  echo "" | jobs_intro_style body
-  read -r "?👉 已了解脚本用途与影响，按回车继续；按 Ctrl+C 取消：" _
+  if [[ ! -t 0 ]]; then
+    print -u2 -r -- '当前没有可交互输入，请在终端中重新运行。'
+    exit 1
+  fi
+  if ! read -r "?👉 已了解脚本用途与影响，按回车继续；按 Ctrl+C 取消：" _; then
+    print -u2 -r -- '输入已结束，未执行后续业务。'
+    exit 1
+  fi
 }
-# 编排脚本的高层业务流程。
-# 初始化本次运行的日志文件。
-initialize_execution_log() {
-  : > "$LOG_FILE"
+# 兼容仓库根目录裸脚本和直属同名脚本目录，确认后计算实际父仓。
+initialize_script_paths() {
+  SCRIPT_FILE="${SCRIPT_FILE:A}"
+  SCRIPT_DIR="${SCRIPT_FILE:h}"
+  SCRIPT_BASENAME="${SCRIPT_FILE:t:r}"
+  REPO_ROOT="$SCRIPT_DIR"
+  if [[ "${SCRIPT_DIR:t}" == "${SCRIPT_FILE:t}" ]]; then
+    REPO_ROOT="${SCRIPT_DIR:h}"
+  fi
+  LOG_FILE="${TMPDIR:-/tmp}/${SCRIPT_BASENAME}.log"
 }
-# 创建交互预览文件并注册退出清理。
+# 确认后定位父仓、载入本仓清单并准备实际下载线路。
+prepare_parent_repository() {
+  cd_to_script_dir || return 1 # 以当前入口推导的父仓根目录作为全部相对路径基准。
+  load_configured_submodules || return 1 # 保留各仓独立清单与已有共享登记。
+  ensure_repo_initialized || return 1 # 拒绝非仓库或位于错误层级的目录。
+  configure_gitee_https_transport || return 1 # 在首次联网前配置当前进程的 Gitee HTTPS 规则。
+  ensure_git_remote "$REMOTE_NAME" || return 1 # 检查所选父仓远端并显示实际线路。
+}
+# 保留既有分支选择及父仓拉取策略。
+synchronize_parent_repository() {
+  ensure_parent_branch || return 1 # 确认当前父仓分支后再拉取。
+  parent_pull_rebase # 父仓有未提交改动时按既有策略跳过拉取。
+}
+# 创建当前运行的菜单预览文件，并在退出时回收。
 prepare_preview_runtime() {
-  PREVIEW_FILE="$(mktemp "/tmp/${SCRIPT_BASENAME}.preview.XXXXXX")"
-  trap '[[ -n "${PREVIEW_FILE:-}" ]] && rm -f "$PREVIEW_FILE"' EXIT
+  PREVIEW_FILE="$(mktemp "${TMPDIR:-/tmp}/${SCRIPT_BASENAME}.preview.XXXXXX")" || return 1
+  trap '[[ -z "${PREVIEW_FILE:-}" ]] || rm -f -- "$PREVIEW_FILE"' EXIT
 }
-# 编排脚本的高层业务流程。
-# 初始化脚本运行环境，并集中承载原有的顶层执行逻辑。
+# 仅在菜单流程成功结束后输出完成摘要。
+report_completion() {
+  success_echo "全部完成 ✅"
+  note_echo "日志文件：$LOG_FILE"
+}
+# 确认后集中初始化环境、路径与日志，函数外不执行真实操作。
 initialize_script_runtime() {
   emulate -R zsh
   set -e
   set -o pipefail
   setopt NO_NOMATCH
-  if [[ "$SCRIPT_FILE" != /* ]]; then
-    SCRIPT_FILE="$PWD/$SCRIPT_FILE"
-  fi
+  export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+  export LANG="${LANG:-zh_CN.UTF-8}"
+  export LC_CTYPE="${LC_CTYPE:-UTF-8}"
+  initialize_script_paths || return 1
+  : > "$LOG_FILE"
 }
 # 编排脚本的高层业务流程。
 main() {
-  # 展示配套 README，确认子模块同步范围后继续。
-  show_script_intro_and_wait
-  # 初始化 Shell 选项、日志、依赖和入口运行状态。
-  initialize_script_runtime
-  # 清空当前脚本旧日志，确保本次记录独立可查。
-  initialize_execution_log
-  # 切换到脚本所在仓库，避免相对路径指向错误位置。
-  cd_to_script_dir
-  # 加载脚本中维护的目标子模块配置。
-  load_configured_submodules
-
-  # 确认当前目录已经初始化为 Git 仓库。
-  ensure_repo_initialized
-  # 检查并修复父仓库远程地址配置。
-  configure_gitee_https_transport || return 1 # 在首次父仓联网与递归克隆前注入进程规则。
-  ensure_git_remote "$REMOTE_NAME"
-  # 确保父仓库处于可同步的目标分支。
-  ensure_parent_branch
-  # 在处理子模块前同步父仓库最新提交。
-  parent_pull_rebase
-
-  # fzf 必须在第一次使用前完成自检；缺失时自动检查/安装 Homebrew，再安装 fzf。
-  ensure_fzf_healthy
-
-  # 创建 fzf 预览文件并注册退出清理。
-  prepare_preview_runtime
-  # 进入交互菜单，按用户选择执行子模块同步动作。
-  main_menu_loop "$PREVIEW_FILE"
-
-  # 输出全部流程的完成状态。
-  success_echo "全部完成 ✅"
-  # 输出日志文件位置，方便后续排查。
-  note_echo "日志文件：$LOG_FILE"
+  show_script_intro_and_wait # 首先展示内置自述，确认失败立即停止。
+  initialize_script_runtime # 确认后初始化 Shell、入口路径和本轮日志。
+  prepare_parent_repository # 验证父仓根目录，载入本仓清单并准备下载线路。
+  synchronize_parent_repository # 按既有分支规则先处理父仓更新。
+  ensure_fzf_healthy # 复用可用菜单工具，缺失时才处理依赖。
+  prepare_preview_runtime # 准备菜单预览及退出清理。
+  main_menu_loop "$PREVIEW_FILE" # 根据菜单选择同步，失败立即向入口传播。
+  report_completion # 成功后汇总结果与日志位置。
 }
 
 main "$@"

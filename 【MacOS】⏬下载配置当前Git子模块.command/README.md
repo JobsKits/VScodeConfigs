@@ -8,7 +8,9 @@
 
 ## 🔥 <font id=前言>前言</font>
 
-`【MacOS】⏬下载配置当前Git子模块.command` 用于执行“【MacOS】⏬下载配置当前Git子模块”对应的 MacOS 自动化流程。主脚本与本 `README.md` 必须保持在同一目录，运行前先阅读影响范围。
+[**Git**](https://git-scm.com/) 子模块脚本的用途与执行顺序见[专章说明](#git-submodule-scripts)。
+
+`【MacOS】⏬下载配置当前Git子模块.command` 用于下载、更新上一级 `VScodeConfigs` 父仓清单中的子模块。脚本与本 `README.md` 放在当前同名目录，运行时自动定位上一级父仓。
 
 <strong id="git-source-log">运行时先看这里：子 Git 从哪里拉取</strong>
 
@@ -27,7 +29,7 @@
 
 父仓线路、首次克隆和拉取更新各有来源块；已能读取 `.gitmodules` 的递归子仓，在更新前显示“递归来源核对”。首次原生递归克隆仍由 Git 输出注册 URL。平台按地址中的主机识别，不按本地目录名判断。
 
-若 `insteadOf` 改写了 URL，来源块同时列出“解析地址”和“拉取地址”；后者由 `git ls-remote --get-url` 在本地展开，未探测 HTTP 重定向或代理最终出口。首次克隆只读取系统、全局及本次进程的规则，不沿用父仓本地 `insteadOf`；已有子仓拉取读取自身配置，递归子仓也分别按未初始化 / 已初始化采用这两种作用域。新来源块在支持颜色的终端重点显示，写入日志时保留纯文本；URL 凭据与查询参数会脱敏。来源日志位于系统临时目录 `/tmp` 中的 `【MacOS】⏬下载配置当前Git子模块.log`，Git 原生进度仍以终端输出为准。
+若 `insteadOf` 改写了 URL，来源块同时列出“解析地址”和“拉取地址”；后者由 `git ls-remote --get-url` 在本地展开，未探测 HTTP 重定向或代理最终出口。首次克隆只读取系统、全局及本次进程的规则，不沿用父仓本地 `insteadOf`；已有子仓拉取读取自身配置，递归子仓也分别按未初始化 / 已初始化采用这两种作用域。新来源块在支持颜色的终端重点显示，写入日志时保留纯文本；URL 凭据与查询参数会脱敏。来源日志位于系统临时目录，文件名为 `【MacOS】⏬下载配置当前Git子模块.log`，Git 原生进度仍以终端输出为准。
 
 <strong id="submodule-quick-look">先看例子：从哪个平台下载父仓，子仓就跟着走</strong>
 
@@ -60,13 +62,13 @@ url = https://github.com/JobsKits/VScodeConfigByFlutter.git
 
 **下载脚本的 Gitee 传输规则：** `【MacOS】⏬下载配置当前Git子模块.command` 在本次运行中，将 `git@gitee.com:`、`ssh://git@gitee.com/`、`ssh://git@gitee.com:22/` 开头的标准地址统一通过 `https://gitee.com/` 访问，保留账号、真实仓名和分支；即使设置 `GIT_URL_STYLE=ssh`，这类 Gitee 地址仍使用 HTTPS。首次 `clone --recurse-submodules` 和后续递归同步都继承该规则，历史子模块中的 SSH 地址无需新电脑先配置 SSH 密钥。
 
-规则通过追加进程级 `GIT_CONFIG_COUNT` / `url.https://gitee.com/.insteadOf` 配置传给子进程，不写入全局 Git 配置，也不依赖其它工程路径。GitHub、其它主机及非 `22` 的自定义 SSH 端口保持原规则。克隆或递归更新失败会返回非零状态，停止本轮同步并保留错误；不会再输出该项同步成功。原有清单、浅克隆参数和全量模式的删除重建策略保留。
+规则通过追加进程级 `GIT_CONFIG_COUNT` / `url.https://gitee.com/.insteadOf` 配置传给子进程，不写入全局 Git 配置，也不依赖其它工程路径。GitHub、其它主机及非 `22` 的自定义 SSH 端口保持原规则。克隆或递归更新失败会返回非零状态，停止本轮同步并保留错误；不会再输出该项同步成功。各仓清单与浅克隆参数保留；全量删除重建须输入 `YES` 确认，范围限定为清单目标及对应旧仓名目录。
 
 ## 一、适用场景 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
-- 需要执行“【MacOS】⏬下载配置当前Git子模块”所描述的本机开发或维护任务。
-- 希望通过可重复运行的 Shell 脚本减少手工命令遗漏。
-- 需要结合终端日志定位环境、路径或第三方工具问题。
+- 首次下载清单中的 `🐦VScodeConfigByFlutter` 子模块。
+- 更新已有子仓到远端目标分支最新提交，或多选指定同步项。
+- 输入新仓地址，补齐登记并同步到父仓。
 
 ## 二、目录结构 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
@@ -81,11 +83,11 @@ url = https://github.com/JobsKits/VScodeConfigByFlutter.git
 - 确认当前系统为 MacOS，并已安装脚本实际调用的工具。
 - 确认脚本路径、工程目录、输入文件和当前 Git 工作区正确。
 - 打开主脚本检查其中的业务命令，不理解的操作不要直接执行。
-- 涉及安装、更新或升级时，以脚本终端提示为准；直接回车应表示跳过。
+- 进入脚本自述时回车继续；菜单中的全量模式须输入 `YES` 才删除并重建目标目录，执行前确认范围。
 
 ## 四、运行方式 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
-### 4.1、双击运行 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
+### 4.1、<span id="download-double-click">双击运行</span> <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
 在 Finder 中打开当前目录并双击 `【MacOS】⏬下载配置当前Git子模块.command`。阅读终端自述后按回车继续，按 `Ctrl+C` 取消。
 
@@ -100,23 +102,18 @@ cd "脚本所在目录/【MacOS】⏬下载配置当前Git子模块.command"
 
 ## 五、操作流程 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
-1、展示脚本内置自述并等待回车。
-2、检查运行环境、输入参数和目标路径。
-3、按脚本提示确认需要执行的业务步骤。
-4、输出执行结果、失败原因和日志位置。
+按 [Git 子模块脚本](#git-submodule-scripts) 中的时间顺序执行，菜单操作见[双击运行](#download-double-click)。
 
 ## 六、风险说明 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
-- 脚本包含删除、清理或重置动作，执行前必须确认目标路径和影响范围。
-- 脚本可能访问网络、下载文件或更新本机工具链。
-- 脚本可能修改 Git 工作区或仓库配置，运行前应确认当前仓库和分支。
-- 脚本会调用 Flutter / Dart 工具链，运行前应确认工程根目录和 SDK 版本。
-
-危险操作必须以脚本中的 `YES` 确认为准；如果脚本尚未提供明确确认，应先审查脚本内容，不要盲目执行。
+- 全量模式删除清单目标及对应旧仓名目录后重建；须输入 `YES` 确认，其它输入取消。
+- 更新使用 `checkout -B` / `reset --hard` 强制对齐远端；未提交改动会阻断，但本地独有提交仍可能被覆盖或随目录重建丢失。
+- 默认会创建父仓提交，不自动推送；运行前检查父仓暂存区，设 `AUTO_PARENT_COMMIT=0` 可保留修改待审阅。
+- 脚本会联网拉取代码；缺少菜单工具时可能安装 Homebrew / fzf，按终端实际提示操作。
 
 ## 七、日志文件 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
-脚本日志写入系统临时目录 `/tmp` 中的 `【MacOS】⏬下载配置当前Git子模块.log`。新来源块以纯文本保存；Git 原生下载进度仍以终端输出为准。
+脚本日志写入系统临时目录，文件名为 `【MacOS】⏬下载配置当前Git子模块.log`。新来源块以纯文本保存；Git 原生下载进度仍以终端输出为准。
 
 ## 八、常见问题 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
@@ -155,5 +152,31 @@ AUTO_PARENT_COMMIT=0 \
 ```
 
 普通 `git clone --recurse-submodules` 由 Git 依据父仓默认 remote 解析相对 URL；`REMOTE_NAME` 是本脚本的线路选择参数。
+
+## 十一、<span id="git-submodule-scripts">Git 子模块脚本</span> <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
+
+### 11.1、`【MacOS】⏬下载配置当前Git子模块.command` <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
+
+入口：`./【MacOS】⏬下载配置当前Git子模块.command`（脚本自动定位上一级父仓）。
+
+- 1、阅读说明并确认，定位父仓，载入脚本清单（`VScodeConfigByFlutter` 挂载到 `🐦VScodeConfigByFlutter`）。
+
+- 2、检查父仓远端和分支，先拉取父仓更新。
+  - 父仓有未提交改动时跳过拉取，继续进入子模块菜单。
+
+- 3、选择处理范围。
+  - 全量：选择清单目标重建；须输入 `YES` 执行，其它输入取消。
+  - 只更新已有：更新清单中本地已有的子仓；一个也没有时转全量。
+  - 多选：只同步勾选项；添加：输入新仓地址后登记并同步。
+
+- 4、补齐登记，按所选模式检查并处理目标目录；缺失目录会下载，全量模式会先删除重建。
+  - 子仓有未提交改动时停止该次更新或删除。
+
+- 5、拉取所选子仓，默认优先对齐远端 `main`，没有则改用远端默认分支；再同步其内部子模块到各自父仓记录的提交。
+  - 强制对齐可能覆盖本地目标分支的独有提交；全量重建还可能丢失被删除目录中的本地历史。
+
+- 6、默认自动提交父仓的子模块登记与指针变化，不自动推送；设 `AUTO_PARENT_COMMIT=0` 可保留待检查。
+
+**目的：** 把所选子仓代码更新到远端目标分支最新提交，并维护父仓的子模块关联。
 
 <a id="🔚" href="#前言" style="font-size:17px; color:green; font-weight:bold;">我是有底线的➤点我回到首页</a>
