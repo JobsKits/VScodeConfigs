@@ -2,13 +2,26 @@
 
 ![Jobs出品，必属精品](https://picsum.photos/1500/400)
 
-[toc]
+<!-- jobs-toc:start -->
+<!-- jobs-toc:source {"v":2,"token":"[toc]"} -->
+<details>
+<summary>📚 目录（点击展开 / 收起）</summary>
+
+- [🔥 前言](#jobs-toc-heading-1)
+- [一、目录定位](#jobs-toc-heading-2)
+- [二、维护规则](#jobs-toc-heading-3)
+- [三、Git 子模块脚本](#git-submodule-scripts)
+  - [【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command](#jobs-toc-heading-5)
+- [四、实际目录结构](#repository-layout)
+
+</details>
+<!-- jobs-toc:end -->
 
 [实际目录结构](#repository-layout) · [Git 子模块脚本](#git-submodule-scripts)
 
 ---
 
-## 🔥 <font id=前言>前言</font>
+## <span id="jobs-toc-heading-1" data-jobs-toc="v2">🔥 <font id=前言>前言</font></span><!-- jobs-toc:heading-end -->
 
 [**Git**](https://git-scm.com/) 子模块脚本的用途与执行顺序见[专章说明](#git-submodule-scripts)。
 
@@ -35,13 +48,13 @@
 
 `path` 是本地目录，`url` 是远端仓库位置；相对 URL 跟随父仓默认远端的平台、组织、协议与端口，前提是该平台已有对应子仓及父仓锁定的提交。已有克隆须核对默认远端和本地子模块配置，仅新增 remote 不会切换线路。
 
-## 一、目录定位 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
+## <span id="jobs-toc-heading-2" data-jobs-toc="v2">一、目录定位 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a></span><!-- jobs-toc:heading-end -->
 
 - 通用编辑器配置放在当前目录。
 - [**Flutter**](https://flutter.dev/) 专用配置放在 `🐦VScodeConfigByFlutter`。
 - 后续新增语言或项目类型配置时，优先使用独立子目录承载。
 
-## 二、维护规则 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
+## <span id="jobs-toc-heading-3" data-jobs-toc="v2">二、维护规则 <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a></span><!-- jobs-toc:heading-end -->
 
 - 配置文件名、路径、命令统一使用反引号。
 - 不提交本机隐私路径、账号信息或临时缓存。
@@ -49,16 +62,16 @@
 
 ## 三、<span id="git-submodule-scripts">Git 子模块脚本</span> <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
-### [【MacOS】⏬下载配置当前Git子模块.command](./【MacOS】⏬下载配置当前Git子模块.command/【MacOS】⏬下载配置当前Git子模块.command)
+### <span id="jobs-toc-heading-5" data-jobs-toc="v2">[【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command](./【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command/【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command)</span><!-- jobs-toc:heading-end -->
 
-> **目的：** 把所选子仓代码更新到远端目标分支最新提交，并维护父仓的子模块关联。
+> **目的：** 把所选子仓及可选的后代子模块更新到各自远端目标分支最新提交，并维护入口父仓的子模块关联。
 
 * 阅读说明并确认，定位父仓，载入脚本清单（`VScodeConfigByFlutter` 挂载到 `🐦VScodeConfigByFlutter`）。
 
 * 检查父仓远端和分支，先拉取父仓更新。
   * 父仓有未提交改动时跳过拉取，继续进入子模块菜单。
 
-* 选择处理范围。
+* 在主菜单选择同步范围；“切换同步深度”可在默认“向下递归”和“仅直属子模块”之间切换，当前深度适用于各同步动作。
   * 全量：选择清单目标重建；须输入 `YES` 执行，其它输入取消。
   * 只更新已有：更新清单中本地已有的子仓；一个也没有时转全量。
   * 多选：只同步勾选项；添加：输入新仓地址后登记并同步。
@@ -66,20 +79,24 @@
 * 补齐登记，按所选模式检查并处理目标目录；缺失目录会下载，全量模式会先删除重建。
   * 子仓有未提交改动时停止该次更新或删除。
 
-* 拉取所选子仓，默认优先对齐远端 `main`，没有则改用远端默认分支；再同步其内部子模块到各自父仓记录的提交。
+* 拉取并强制对齐远端目标分支最新提交：优先使用该层 `.gitmodules` 显式 `branch`，`.` 继承直接父仓分支；未设置时优先 `main`，不存在则使用远端默认分支。
+
+* 按当前深度同步：默认逐层读取所选子仓下的 `.gitmodules`，将已登记后代同步到各自远端目标分支最新提交；仅直属模式不下载或更新下层代码。
+  * 只处理本层所选子树，不向上扫描，也不接管未登记的嵌套仓库。
+  * 深层只下载更新，不自动暂存或提交其父仓的 gitlink；递归后这些父仓可能显示子模块指针改动，保留待审阅。
   * 强制对齐可能覆盖本地目标分支的独有提交；全量重建还可能丢失被删除目录中的本地历史。
 
-* 默认自动提交父仓的子模块登记与指针变化，不自动推送；设 `AUTO_PARENT_COMMIT=0` 可保留待检查。
+* 默认自动提交入口父仓的子模块登记与指针变化，不自动推送；设 `AUTO_PARENT_COMMIT=0` 可保留待检查。
 
-入口：`./【MacOS】⏬下载配置当前Git子模块.command/【MacOS】⏬下载配置当前Git子模块.command`。
+入口：`./【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command/【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command`。
 
 ## 四、<span id="repository-layout">实际目录结构</span> <a href="#前言" style="font-size:17px; color:green;"><b>🔼</b></a> <a href="#🔚" style="font-size:17px; color:green;"><b>🔽</b></a>
 
 ```text
 ⚙️VScodeConfigs/
 ├── README.md / .gitignore / .gitmodules / icon.png
-├── 【MacOS】⏬下载配置当前Git子模块.command/
-│   ├── 【MacOS】⏬下载配置当前Git子模块.command
+├── 【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command/
+│   ├── 【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command
 │   └── README.md
 └── 🐦VScodeConfigByFlutter/                 # 独立 Git 子仓，配置和注入入口见其 README
 ```

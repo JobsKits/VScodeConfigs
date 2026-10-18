@@ -1,9 +1,9 @@
 #!/bin/zsh
 # 脚本自述：
-# - 脚本名称：【MacOS】⏬下载配置当前Git子模块.command
+# - 脚本名称：【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command
 # - 来源日志：克隆 / 拉取前突出平台与完整地址，完成时带来源，保留递归来源核对。
 # - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS，递归子模块继承，不写全局配置。
-# - 核心用途：按各仓独立清单下载、更新和登记 Git 子模块，支持根目录或直属同名脚本目录。
+# - 核心用途：按各仓独立清单下载、更新和登记 Git 子模块；可逐层同步所选子树，也可只同步直属一层。
 # - 影响范围：父仓登记、索引与提交，子仓工作区和分支；全量模式仅删除清单目标及对应旧仓名目录。
 # - 运行提示：先阅读内置自述并回车确认；全量重建另需 YES；Ctrl+C 取消，默认提交父仓但不推送。
 
@@ -238,12 +238,13 @@ PRUNE_STALE_GITMODULES="${PRUNE_STALE_GITMODULES:-0}"  # 1=删除 .gitmodules �
 SUBMODULE_SHALLOW_CLONE="${SUBMODULE_SHALLOW_CLONE:-1}"    # 1=子仓浅克隆，只拿最新必要历史；0=完整克隆
 SUBMODULE_DEPTH="${SUBMODULE_DEPTH:-1}"                    # 浅克隆深度；默认 1，只锚定最新一层提交
 SUBMODULE_FETCH_TAGS="${SUBMODULE_FETCH_TAGS:-0}"          # 1=同步 tags；默认 0，软件大包仓库不拉 tags 更快
+SUBMODULE_RECURSIVE="${SUBMODULE_RECURSIVE:-1}"            # 1=向下逐层同步最新代码；0=仅同步所选直属子仓，可在菜单切换
 
 # ============================== 脚本路径定位 ==============================
 SCRIPT_FILE="${(%):-%x}"
 SCRIPT_DIR=""
 REPO_ROOT=""
-SCRIPT_BASENAME="【MacOS】⏬下载配置当前Git子模块"
+SCRIPT_BASENAME="【MacOS】⏬下载配置当前Git子模块（可向下同步递归）"
 LOG_FILE="${TMPDIR:-/tmp}/${SCRIPT_BASENAME}.log"
 PREVIEW_FILE=""
 
@@ -996,14 +997,14 @@ ensure_parent_branch() {
   fi
 
   if git rev-parse --verify "$b" >/dev/null 2>&1; then
-    run_cmd git -c core.quotepath=false checkout "$b"
+    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules "$b"
     return 0
   fi
 
   if git ls-remote --exit-code --heads "$REMOTE_NAME" "$b" >/dev/null 2>&1; then
-    run_cmd git -c core.quotepath=false checkout -B "$b" --track "$REMOTE_NAME/$b"
+    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules -B "$b" --track "$REMOTE_NAME/$b"
   else
-    run_cmd git -c core.quotepath=false checkout -B "$b"
+    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules -B "$b"
   fi
 }
 # 封装 parent_pull_rebase 对应的独立处理逻辑。
@@ -1017,9 +1018,9 @@ parent_pull_rebase() {
     return 0
   fi
 
-  run_cmd git fetch "$REMOTE_NAME" || true
+  run_cmd git -c submodule.recurse=false fetch --recurse-submodules=no "$REMOTE_NAME" || true
   if git ls-remote --exit-code --heads "$REMOTE_NAME" "$b" >/dev/null 2>&1; then
-    run_cmd git pull --rebase "$REMOTE_NAME" "$b" || warn_echo "父仓 pull --rebase 未完成，请检查是否存在冲突；本次继续处理子模块"
+    run_cmd git -c submodule.recurse=false pull --no-recurse-submodules --rebase "$REMOTE_NAME" "$b" || warn_echo "父仓 pull --rebase 未完成，请检查是否存在冲突；本次继续处理子模块"
   fi
 }
 # 封装 parent_push_if_needed 对应的独立处理逻辑。
@@ -1097,14 +1098,38 @@ assert_clean_submodule() {
   fi
 
   local dirty=""
-  dirty="$(git -C "$submodule_path" -c core.quotepath=false status --porcelain --untracked-files=normal)"
+  dirty="$(git -C "$submodule_path" -c core.quotepath=false status --porcelain --untracked-files=normal --ignore-submodules=all)" || return 1
   if [[ -n "$dirty" ]]; then
     error_echo "子 Git 存在尚未提交内容，已终止${action}：$submodule_path"
     printf '%s\n' "$dirty"
     return 1
   fi
 
+  if ! git -C "$submodule_path" diff --cached --quiet --ignore-submodules=none --; then
+    error_echo "子 Git 存在已暂存内容或子模块指针，已终止${action}：$submodule_path"
+    return 1
+  fi
+
+  # 允许此前同步产生的后代 HEAD 差异，但在更新祖先前先保护后代源码。
+  if [[ "$SUBMODULE_RECURSIVE" == 1 && -f "$submodule_path/.gitmodules" ]]; then
+    local keys="" key="" child_path=""
+    keys="$(submodule_path_keys "$submodule_path")" || return 1
+    for key in "${(@f)keys}"; do
+      [[ -n "$key" ]] || continue
+      child_path="$(git config -f "$submodule_path/.gitmodules" --get "$key")" || return 1
+      validate_submodule_url_path "$PWD/$submodule_path" "$child_path" || return 1
+      assert_clean_submodule "$submodule_path/$child_path" "$action" || return 1
+    done
+  fi
   return 0
+}
+# 校验配置后枚举直属登记，读取失败不能当作没有子模块。
+submodule_path_keys() {
+  local repo_root="$1" result=0
+  [[ -f "$repo_root/.gitmodules" ]] || return 0
+  git config -f "$repo_root/.gitmodules" --list >/dev/null || return 1
+  git config -f "$repo_root/.gitmodules" --name-only --get-regexp '^submodule\..*\.path$' || result=$?
+  [[ "$result" == 0 || "$result" == 1 ]]
 }
 # ============================== .gitmodules 查漏补缺 ==============================
 # 保留已有共享登记文件，缺失时才建立空文件。
@@ -1417,7 +1442,13 @@ remove_worktree_dir_safely() {
     return 1
   fi
 
-  assert_clean_submodule "$submodule_path" "删除目录" || return 1
+  # 删除父目录会连同后代一起移除，即使只下载一层也必须保护后代改动。
+  if ! (
+    SUBMODULE_RECURSIVE=1
+    assert_clean_submodule "$submodule_path" "删除目录"
+  ); then
+    return 1
+  fi
   submodule_cache="$(submodule_cache_for_removal "$submodule_path")" || return 1
 
   if is_gitlink_registered "$submodule_path"; then
@@ -1445,17 +1476,17 @@ remove_worktree_dir_safely() {
 # 封装 clone_submodule_worktree 对应的独立处理逻辑。
 clone_submodule_worktree() {
   local submodule_path="$1"
-  local url=""
-  url="$(clone_url_for_path "$submodule_path")" || return 1
+  local url="${2:-}" preferred="${3:-$SUBMODULE_BRANCH}"
+  [[ -n "$url" ]] || url="$(clone_url_for_path "$submodule_path")" || return 1
   print_git_source "首次克隆" "$submodule_path" "$PWD" "$url" clone
   local branch=""
-  branch="$(remote_branch_for_url "$url" "$SUBMODULE_BRANCH")" || return 1
+  branch="$(remote_branch_for_url "$url" "$preferred")" || return 1
 
   local -a clone_args
   clone_args=()
 
   if [[ "$SUBMODULE_SHALLOW_CLONE" == "1" ]]; then
-    clone_args+=(--depth "$SUBMODULE_DEPTH" --single-branch --shallow-submodules)
+    clone_args+=(--depth "$SUBMODULE_DEPTH" --single-branch)
   fi
 
   if [[ "$SUBMODULE_FETCH_TAGS" != "1" ]]; then
@@ -1464,10 +1495,10 @@ clone_submodule_worktree() {
 
   if remote_branch_exists "$url" "$branch"; then
     info_echo "克隆分支：$branch"
-    run_cmd git clone "${clone_args[@]}" --branch "$branch" --recurse-submodules --jobs="$(get_ncpu)" "$url" "$submodule_path" || return 1
+    run_cmd git -c submodule.recurse=false clone "${clone_args[@]}" --branch "$branch" --no-recurse-submodules -- "$url" "$submodule_path" || return 1
   else
     warn_echo "远端未确认存在分支 $branch，将按远端默认分支 clone：$submodule_path"
-    run_cmd git clone "${clone_args[@]}" --recurse-submodules --jobs="$(get_ncpu)" "$url" "$submodule_path" || return 1
+    run_cmd git -c submodule.recurse=false clone "${clone_args[@]}" --no-recurse-submodules -- "$url" "$submodule_path" || return 1
   fi
 
   run_cmd git -C "$submodule_path" config core.quotepath false || true
@@ -1478,6 +1509,16 @@ clone_submodule_worktree() {
 # 检查当前运行条件是否满足后续流程要求。
 ensure_submodule_worktree_present() {
   local submodule_path="$1"
+  local url="${2:-}" preferred="${3:-$SUBMODULE_BRANCH}" stage_association="${4:-1}"
+  # 已有缓存必须先核验；缺少工作区时保留缓存，避免 clone 后吸收覆盖冲突。
+  if [[ ! -e "$submodule_path/.git" ]]; then
+    local cached_gitdir=""
+    cached_gitdir="$(submodule_cache_for_removal "$submodule_path")" || return 1
+    if [[ -n "$cached_gitdir" ]]; then
+      error_echo "子仓工作区缺失但 Git 缓存仍存在，已保留且停止：$cached_gitdir；请先用 Git 恢复该工作区，或选择全量重建。"
+      return 1
+    fi
+  fi
 
   # 不走 git submodule update 做首次下载，因为它会严格使用 .gitmodules 的 url。
   # 这里按 .gitmodules 与所选父 remote 的完整地址解析下载，保留绝对 URL 例外。
@@ -1493,19 +1534,23 @@ ensure_submodule_worktree_present() {
   fi
 
   if [[ ! -e "$submodule_path" ]]; then
-    clone_submodule_worktree "$submodule_path" || return 1
+    clone_submodule_worktree "$submodule_path" "$url" "$preferred" || return 1
   fi
 
   # 不使用 git submodule add，避免 .gitmodules 被 Git 自动重写；手动 add 会把内部 Git 仓登记为 gitlink。
-  run_cmd git add -- .gitmodules "$submodule_path" || return 1
+  if [[ "$stage_association" == 1 ]]; then
+    run_cmd git --literal-pathspecs add -- .gitmodules "$submodule_path" || return 1
+  fi
 
   # 标准子模块形态：子仓目录里保留 .git 单文件，真正 Git 数据放到父仓 .git/modules 下。
   # 这一步不决定是否浅克隆；浅克隆由 --depth 控制。这里负责把 .git 文件夹吸收到父仓管理。
-  if ! run_cmd git submodule absorbgitdirs -- "$submodule_path"; then
+  if [[ ! -f "$submodule_path/.git" ]] && ! run_cmd git --literal-pathspecs submodule absorbgitdirs -- "$submodule_path"; then
     error_echo "子模块元数据归集失败：$submodule_path；未标记为完成。"
     return 1
   fi
-  run_cmd git add -- .gitmodules "$submodule_path" || return 1
+  if [[ "$stage_association" == 1 ]]; then
+    run_cmd git --literal-pathspecs add -- .gitmodules "$submodule_path" || return 1
+  fi
 
   if [[ "$DRY_RUN" == 1 ]]; then
     note_echo "[DRY-RUN] 已计划登记并归集子模块：$submodule_path"
@@ -1519,7 +1564,7 @@ ensure_submodule_worktree_present() {
 # 解析并返回后续流程需要的目标信息。
 resolve_remote_branch_for_submodule() {
   local submodule_path="$1"
-  local preferred="$SUBMODULE_BRANCH"
+  local preferred="${2:-$SUBMODULE_BRANCH}"
 
   if git -C "$submodule_path" ls-remote --exit-code --heads origin "$preferred" >/dev/null 2>&1; then
     printf '%s\n' "$preferred"
@@ -1538,8 +1583,8 @@ resolve_remote_branch_for_submodule() {
 # 执行对应的环境配置或同步处理。
 sync_one_submodule_to_latest() {
   local submodule_path="$1"
-  local url=""
-  url="$(clone_url_for_path "$submodule_path")" || return 1
+  local url="${2:-}" preferred="${3:-$SUBMODULE_BRANCH}"
+  [[ -n "$url" ]] || url="$(clone_url_for_path "$submodule_path")" || return 1
 
   if [[ ! -e "$submodule_path" ]]; then
     warn_echo "本地目录不存在，跳过：$submodule_path"
@@ -1561,7 +1606,7 @@ sync_one_submodule_to_latest() {
 
   print_git_source "拉取更新" "$submodule_path" "$PWD/$submodule_path" "$url"
   local branch=""
-  if ! branch="$(resolve_remote_branch_for_submodule "$submodule_path")"; then
+  if ! branch="$(resolve_remote_branch_for_submodule "$submodule_path" "$preferred")"; then
     error_echo "无法确定远端可同步分支：$submodule_path"
     return 1
   fi
@@ -1578,36 +1623,73 @@ sync_one_submodule_to_latest() {
   fi
 
   info_echo "拉取分支：origin/$branch"
-  run_cmd git -C "$submodule_path" fetch "${fetch_args[@]}" origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" --prune || return 1
-  run_cmd git -C "$submodule_path" -c core.quotepath=false checkout -B "$branch" "origin/$branch" || return 1
+  run_cmd git -C "$submodule_path" -c submodule.recurse=false fetch --recurse-submodules=no "${fetch_args[@]}" origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" --prune || return 1
+  run_cmd git -C "$submodule_path" -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules -B "$branch" "origin/$branch" || return 1
   run_cmd git -C "$submodule_path" branch --set-upstream-to="origin/$branch" "$branch" >/dev/null 2>&1 || true
-  run_cmd git -C "$submodule_path" reset --hard "origin/$branch" || return 1
+  run_cmd git -C "$submodule_path" -c submodule.recurse=false reset --hard "origin/$branch" || return 1
 
-  sync_submodule_urls_at_repo "$PWD/$submodule_path" "$url" 1 || return 1
-
-  local -a submodule_update_args
-  submodule_update_args=(submodule update --init --recursive --jobs="$(get_ncpu)")
-  if [[ "$SUBMODULE_SHALLOW_CLONE" == "1" ]]; then
-    submodule_update_args+=(--depth "$SUBMODULE_DEPTH" --recommend-shallow)
-  fi
-  if ! run_cmd git -C "$submodule_path" "${submodule_update_args[@]}"; then
+  if [[ "$SUBMODULE_RECURSIVE" == 1 ]] && ! sync_descendant_submodules_to_latest "$PWD/$submodule_path" "$url"; then
     error_echo "递归子模块同步失败：$submodule_path；未标记为同步成功。"
     return 1
   fi
 
   # 再次确保子仓是标准 submodule 形态：工作目录下 .git 为单文件，Git 数据由父仓 .git/modules 托管。
-  if ! run_cmd git submodule absorbgitdirs -- "$submodule_path"; then
+  if [[ ! -f "$submodule_path/.git" ]] && ! run_cmd git --literal-pathspecs submodule absorbgitdirs -- "$submodule_path"; then
     error_echo "子模块元数据归集失败：$submodule_path；未标记为完成。"
     return 1
   fi
 
   success_echo "$submodule_path 已浅同步到 origin/$branch：$(git -C "$submodule_path" rev-parse --short HEAD)（来源：$(safe_git_source_url "$(effective_git_source_url "$PWD/$submodule_path" "$url")")）"
 }
+# 每层读取刚取得的 .gitmodules；不调用子仓脚本，不暂存或提交深层指针。
+sync_descendant_submodules_to_latest() (
+  local repo_root="$1" parent_url="$2" keys="" key="" section="" child_path="" url="" branch=""
+  [[ "$SUBMODULE_RECURSIVE" == 1 ]] || return 0
+  [[ -d "$repo_root" ]] || return 0
+  cd "$repo_root" || return 1
+  keys="$(submodule_path_keys .)" || return 1
+  local -a inherited_urls
+  inherited_urls=("${SUBMODULE_ACTIVE_URLS[@]}")
+  local -a SUBMODULE_ACTIVE_URLS
+  SUBMODULE_ACTIVE_URLS=("${inherited_urls[@]}" "${parent_url%.git}")
+  for key in "${(@f)keys}"; do
+    [[ -n "$key" ]] || continue
+    section="${key#submodule.}"
+    section="${section%.path}"
+    child_path="$(git config -f .gitmodules --get "$key")" || return 1
+    validate_submodule_url_path "$PWD" "$child_path" || {
+      error_echo "拒绝递归仓外或非独立子仓路径：$PWD/$child_path"
+      return 1
+    }
+    if ! git --literal-pathspecs ls-files --stage -- "$child_path" | awk '$1 == "160000" { found=1 } END { exit !found }'; then
+      error_echo "递归条目不是已登记的 gitlink：$PWD/$child_path"
+      return 1
+    fi
+    url="$(git config -f .gitmodules --get "submodule.$section.url")" || return 1
+    if [[ "$url" == ./* || "$url" == ../* ]]; then
+      url="$(resolve_relative_git_url "$parent_url" "$url")" || return 1
+    fi
+    url="$(git_url_with_style "$url")" || return 1
+    if contains_item "${url%.git}" "${SUBMODULE_ACTIVE_URLS[@]}"; then
+      error_echo "检测到子模块祖先地址循环，停止递归：$PWD/$child_path"
+      return 1
+    fi
+    branch="$(git config -f .gitmodules --get "submodule.$section.branch" 2>/dev/null || true)"
+    if [[ "$branch" == . ]]; then
+      branch="$(git symbolic-ref --quiet --short HEAD)" || return 1
+    fi
+    branch="${branch:-$SUBMODULE_BRANCH}"
+    info_echo "向下递归：${PWD#"$REPO_ROOT"/}/$child_path（优先分支：$branch）"
+    run_cmd git config "submodule.$section.url" "$url" || return 1
+    ensure_submodule_worktree_present "$child_path" "$url" "$branch" 0 || return 1
+    sync_one_submodule_to_latest "$child_path" "$url" "$branch" || return 1
+  done
+)
 # 执行对应的环境配置或同步处理。
 sync_selected_submodules_to_latest() {
   local -a paths
   paths=("$@")
-  local p=""
+  local p="" section="" url="" branch=""
 
   if [[ ${#paths} -eq 0 ]]; then
     warn_echo "没有需要同步的子模块"
@@ -1615,8 +1697,23 @@ sync_selected_submodules_to_latest() {
   fi
 
   for p in "${paths[@]}"; do
-    ensure_submodule_worktree_present "$p" || return 1
-    sync_one_submodule_to_latest "$p" || return 1
+    if [[ -L "$p" ]] || ! validate_submodule_url_path "$PWD" "$p"; then
+      error_echo "拒绝同步符号链接、仓外或非独立子仓路径：$p"
+      return 1
+    fi
+    section="$(find_gitmodules_section_by_path "$p" 2>/dev/null || true)"
+    url="$(clone_url_for_path "$p")" || return 1
+    branch=""
+    if [[ -n "$section" ]]; then
+      branch="$(git config -f .gitmodules --get "submodule.$section.branch" 2>/dev/null || true)"
+      run_cmd git config "submodule.$section.url" "$url" || return 1
+    fi
+    if [[ "$branch" == . ]]; then
+      branch="$(git symbolic-ref --quiet --short HEAD)" || return 1
+    fi
+    branch="${branch:-$SUBMODULE_BRANCH}"
+    ensure_submodule_worktree_present "$p" "$url" "$branch" || return 1
+    sync_one_submodule_to_latest "$p" "$url" "$branch" || return 1
   done
 }
 # 封装 stage_and_commit_parent_changes 对应的独立处理逻辑。
@@ -1703,7 +1800,6 @@ full_sync_to_latest() {
   done
 
   sync_selected_submodules_to_latest "${synced_paths[@]}" || return 1
-  sync_submodule_urls_for_remote || return 1
   stage_and_commit_parent_changes "${synced_paths[@]}" || return 1
   parent_push_if_needed || return 1
   success_echo "全量同步完成"
@@ -1736,7 +1832,6 @@ update_existing_to_latest() {
   reconcile_gitmodules_with_config_once || return 1
   info_echo "只同步当前已有的子 Git 目录：${existing_paths[*]}"
   sync_selected_submodules_to_latest "${existing_paths[@]}" || return 1
-  sync_submodule_urls_for_remote || return 1
   stage_and_commit_parent_changes "${existing_paths[@]}" || return 1
   parent_push_if_needed || return 1
   success_echo "已有子模块同步完成"
@@ -1798,7 +1893,6 @@ add_new_git_url_interactive() {
     ensure_gitmodules_entry "$local_path" "$input" || continue
     GITMODULES_RECONCILED=1
     sync_selected_submodules_to_latest "$local_path" || return 1
-    sync_submodule_urls_for_remote || return 1
     stage_and_commit_parent_changes "$local_path" || return 1
     parent_push_if_needed || return 1
 
@@ -2005,7 +2099,6 @@ select_configured_submodules_interactive() {
         reconcile_gitmodules_with_config_once || return 1
         info_echo "开始同步已选择的子模块：${selected_paths[*]}"
         sync_selected_submodules_to_latest "${selected_paths[@]}" || return 1
-        sync_submodule_urls_for_remote || return 1
         stage_and_commit_parent_changes "${selected_paths[@]}" || return 1
         parent_push_if_needed || return 1
         success_echo "已选择子模块同步完成"
@@ -2036,6 +2129,7 @@ select_menu_action() {
     "选择指定子模块同步（可多选）" \
     "只更新目前已有的" \
     "添加并同步一个新的 Git 地址" \
+    "切换同步深度（向下递归 / 仅直属一层）" \
     "退出" \
     | FZF_CONFIG_PREVIEW_FILE="$preview_file" fzf \
         --prompt='请选择操作 > ' \
@@ -2044,10 +2138,31 @@ select_menu_action() {
         --reverse \
         --preview='cat "$FZF_CONFIG_PREVIEW_FILE"' \
         --preview-window='up,70%,border-bottom,nowrap' \
-        --header=$'上方是配置预览区；内容超出时可鼠标滚动，或用 Ctrl+K/J 单行滚动、Ctrl+U/D 翻页。' \
+        --header="当前深度：$(submodule_recursion_label)；可在菜单中切换。上方配置预览支持 Ctrl+K/J 滚动、Ctrl+U/D 翻页。" \
         --bind='ctrl-k:preview-up,ctrl-j:preview-down,ctrl-u:preview-page-up,ctrl-d:preview-page-down')" || return 1
 
   printf '%s\n' "$selected"
+}
+# 将递归配置转为菜单和日志中的明确范围。
+submodule_recursion_label() {
+  if [[ "$SUBMODULE_RECURSIVE" == 1 ]]; then
+    print -r -- '向下递归（所选子树逐层最新）'
+  else
+    print -r -- '仅直属一层（不拉取下层）'
+  fi
+}
+# 单独选择深度，取消后保留当前设置并返回主菜单。
+select_submodule_recursion_interactive() {
+  local selected=""
+  selected="$(printf '%s\n' '向下递归（所选子树逐层最新）' '仅直属一层（不拉取下层）' |
+    fzf --prompt='同步深度 > ' --height=40% --border --reverse \
+      --header="当前：$(submodule_recursion_label)；Esc 返回。递归不向上、不扩展未选子树。")" || return 0
+  case "$selected" in
+    '向下递归（所选子树逐层最新）') SUBMODULE_RECURSIVE=1 ;;
+    '仅直属一层（不拉取下层）') SUBMODULE_RECURSIVE=0 ;;
+    *) return 0 ;;
+  esac
+  info_echo "同步深度已选择：$(submodule_recursion_label)"
 }
 # 展示脚本用途和影响范围，并在执行前等待用户确认。
 build_intro_content() {
@@ -2071,6 +2186,9 @@ build_intro_content() {
 子仓浅克隆: $SUBMODULE_SHALLOW_CLONE
 浅克隆深度: $SUBMODULE_DEPTH
 同步 tags: $SUBMODULE_FETCH_TAGS
+同步深度: $(submodule_recursion_label)
+递归边界: 以当前脚本对应仓库为起点，仅进入所选子仓的 .gitmodules；不向上、不扩展未选子树。
+深层指针: 下层跟随各自分支最新，可能与父仓记录的 gitlink 不同；不自动暂存或提交深层指针。
 
 当前配置的目标子 Git：
 EOF2
@@ -2139,6 +2257,9 @@ main_menu_loop() {
       "添加并同步一个新的 Git 地址")
         add_new_git_url_interactive || return 1
         ;;
+      "切换同步深度（向下递归 / 仅直属一层）")
+        select_submodule_recursion_interactive || return 1
+        ;;
       "退出")
         note_echo "已退出"
         return 0
@@ -2152,8 +2273,9 @@ main_menu_loop() {
 # 打印脚本内置自述，并按运行入口决定是否等待用户确认。
 show_script_intro_and_wait() {
   print -r -- '============================== 脚本内置自述 ==============================' | jobs_intro_style title
-  print -r -- '脚本名称：【MacOS】⏬下载配置当前Git子模块.command' | jobs_intro_style title
-  print -r -- '核心用途：按脚本清单下载、更新或添加父仓的 Git 子模块。' | jobs_intro_style body
+  print -r -- '脚本名称：【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command' | jobs_intro_style title
+  print -r -- '核心用途：按脚本清单下载、更新或添加 Git 子模块；默认向下逐层同步，可在菜单切换为仅直属一层。' | jobs_intro_style body
+  print -r -- '递归边界：从运行脚本对应仓库向下，仅处理所选子树，各层读取自己的 .gitmodules；不向上处理。' | jobs_intro_style body
   print -r -- '影响范围：父仓登记和提交指针、子仓代码与分支；默认自动提交父仓，不自动推送。' | jobs_intro_style body
   print -r -- '关键风险：更新会强制对齐远端；全量模式删除清单目标及对应旧仓名目录，必须另输入 YES。' | jobs_intro_style body
   print -r -- "日志文件：$LOG_FILE" | jobs_intro_style body
@@ -2212,6 +2334,10 @@ initialize_script_runtime() {
   export LANG="${LANG:-zh_CN.UTF-8}"
   export LC_CTYPE="${LC_CTYPE:-UTF-8}"
   initialize_script_paths || return 1
+  if [[ "$SUBMODULE_RECURSIVE" != 0 && "$SUBMODULE_RECURSIVE" != 1 ]]; then
+    print -u2 -r -- 'SUBMODULE_RECURSIVE 只支持 0（仅直属一层）或 1（向下递归）。'
+    return 1
+  fi
   : > "$LOG_FILE"
 }
 # 编排脚本的高层业务流程。
