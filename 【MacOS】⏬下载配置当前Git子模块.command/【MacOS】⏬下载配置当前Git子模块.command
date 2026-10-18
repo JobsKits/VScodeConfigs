@@ -1,6 +1,7 @@
 #!/bin/zsh
 # 脚本自述：
 # - 脚本名称：【MacOS】⏬下载配置当前Git子模块.command
+# - 来源日志：克隆 / 拉取前突出平台与完整地址，完成时带来源，保留递归来源核对。
 # - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS，递归子模块继承，不写全局配置。
 # - 核心用途：执行“⏬下载配置当前Git子模块”对应的 Git / Sourcetree 自动化操作。
 # - 影响范围：可能修改当前仓库、工作区、分支、菜单配置或 Git 索引。
@@ -270,6 +271,66 @@ warn_echo()    { log "⚠️  $*"; }
 error_echo()   { printf '%s\n' "❌ $*" >&2; printf '%s\n' "❌ $*" >> "$LOG_FILE"; }
 # 输出 note echo 对应级别的日志信息。
 note_echo()    { log "📝 $*"; }
+
+# 来源重点只在交互终端着色，日志始终保存可直接搜索的纯文本。
+source_highlight_echo() {
+  local message="$1"
+  printf '%s\n' "$message" >> "$LOG_FILE"
+  if [[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != dumb && -z "${NO_COLOR+x}" &&
+        "${PLAIN_OUTPUT:-0}" != 1 && "${IS_SOURCETREE_RUNTIME:-0}" != 1 ]]; then
+    printf '\033[1;36m%s\033[0m\n' "$message"
+  else
+    printf '%s\n' "$message"
+  fi
+}
+# 只处理日志展示，不改变 Git 实际使用的地址。
+safe_git_source_url() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | sed -E \
+    -e 's#(https?://)[^/@]*@#\1[凭据已隐藏]@#' \
+    -e 's#(://)[^/@]*:[^/@]*@#\1[凭据已隐藏]@#' \
+    -e 's#[?#].*$#[参数已隐藏]#'
+}
+# --get-url 仅展开本地 insteadOf；在与该次 Git 操作相同的仓库作用域读取。
+effective_git_source_url() {
+  local repo_root="$1" url="$2" scope="${3:-repository}" effective_url=""
+  if [[ "$scope" == clone ]]; then
+    # clone 不读取父仓 local 配置，保留全局、系统和进程级规则。
+    effective_url="$(GIT_DIR=/dev/null git -C "$repo_root" ls-remote --get-url -- "$url" 2>/dev/null)" || effective_url="$url"
+  else
+    effective_url="$(git -C "$repo_root" ls-remote --get-url -- "$url" 2>/dev/null)" || effective_url="$url"
+  fi
+  printf '%s\n' "$effective_url"
+}
+# 平台名称只用于展示；其它托管服务直接显示真实主机和端口。
+git_source_platform() {
+  local url="$1" host=""
+  case "$url" in
+    file://*) printf '%s\n' '本地文件'; return 0 ;;
+    *://*) host="${url#*://}"; host="${host%%/*}"; host="${host##*@}" ;;
+    *@*:*) host="${url%%:*}"; host="${host##*@}" ;;
+    *) printf '%s\n' '本地路径'; return 0 ;;
+  esac
+  case "${(L)host}" in
+    github.com|github.com:443|github.com:22) printf 'GitHub（%s）\n' "$host" ;;
+    gitee.com|gitee.com:443|gitee.com:22) printf 'Gitee（%s）\n' "$host" ;;
+    gitlab.com|gitlab.com:443|gitlab.com:22) printf 'GitLab（%s）\n' "$host" ;;
+    *) safe_git_source_url "$host"; printf '\n' ;;
+  esac
+}
+# 联网前突出本次来源，重写地址与解析地址不同时同时展示。
+print_git_source() {
+  local action="$1" repo_label="$2" repo_root="$3" url="$4" scope="${5:-repository}" effective_url=""
+  effective_url="$(effective_git_source_url "$repo_root" "$url" "$scope")"
+  source_highlight_echo "━━━━━━━━━━ Git 来源｜$action ━━━━━━━━━━"
+  source_highlight_echo "📦 仓库：$repo_label"
+  source_highlight_echo "🌐 平台 / 主机：$(git_source_platform "$effective_url")"
+  if [[ "$effective_url" != "$url" ]]; then
+    source_highlight_echo "🔎 解析地址：$(safe_git_source_url "$url")"
+  fi
+  source_highlight_echo "📥 拉取地址：$(safe_git_source_url "$effective_url")"
+  source_highlight_echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+}
+
 # 执行 run cmd 对应的独立业务步骤。
 run_cmd() {
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -804,7 +865,10 @@ ensure_git_remote() {
   local remote_name="${1:-$REMOTE_NAME}"
 
   if git remote get-url "$remote_name" >/dev/null 2>&1; then
-    info_echo "父仓远端 [$remote_name] -> $(git remote get-url "$remote_name")"
+    local source_url=""
+    source_url="$(git config --get-all "remote.$remote_name.url" 2>/dev/null || git remote get-url "$remote_name")"
+    source_url="${source_url%%$'\n'*}"
+    print_git_source "父仓线路 [$remote_name]" "$remote_name" "$PWD" "$source_url"
     return 0
   fi
 
@@ -821,7 +885,8 @@ ensure_git_remote() {
 
     if git ls-remote "$remote_url" >/dev/null 2>&1; then
       run_cmd git remote add "$remote_name" "$remote_url"
-      success_echo "已添加父仓远端：$remote_name -> $remote_url"
+      success_echo "已添加父仓远端：$remote_name -> $(safe_git_source_url "$remote_url")"
+      print_git_source "父仓线路 [$remote_name]" "$remote_name" "$PWD" "$remote_url"
       return 0
     fi
 
@@ -877,6 +942,7 @@ validate_submodule_url_path() {
 }
 sync_submodule_urls_at_repo() {
   local repo_root="$1" parent_url="$2" key="" section="" submodule_path="" url="" child_root=""
+  local show_sources="${3:-0}" source_repo="" source_scope=""
   [[ -f "$repo_root/.gitmodules" ]] || return 0
   while IFS= read -r key; do
     section="${key#submodule.}"
@@ -892,10 +958,19 @@ sync_submodule_urls_at_repo() {
       url="$(resolve_relative_git_url "$parent_url" "$url")" || return 1
     fi
     url="$(git_url_with_style "$url")" || return 1
+    if [[ "$show_sources" == 1 ]]; then
+      source_repo="$repo_root"
+      source_scope=clone
+      if [[ -e "$child_root/.git" ]]; then
+        source_repo="$child_root"
+        source_scope=repository
+      fi
+      print_git_source "递归来源核对" "${child_root#"$PWD"/}" "$source_repo" "$url" "$source_scope"
+    fi
     run_cmd git -C "$repo_root" config "submodule.$section.url" "$url" || return 1
     [[ -e "$child_root/.git" ]] || continue
     run_cmd git -C "$child_root" remote set-url origin "$url" || return 1
-    sync_submodule_urls_at_repo "$child_root" "$url" || return 1
+    sync_submodule_urls_at_repo "$child_root" "$url" "$show_sources" || return 1
   done < <(git config -f "$repo_root/.gitmodules" --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null || true)
 }
 # 从显式选择的父 remote 开始，各层只使用自身解析后的地址。
@@ -1306,6 +1381,7 @@ clone_submodule_worktree() {
   local submodule_path="$1"
   local url=""
   url="$(clone_url_for_path "$submodule_path")" || return 1
+  print_git_source "首次克隆" "$submodule_path" "$PWD" "$url" clone
   local branch=""
   branch="$(remote_branch_for_url "$url" "$SUBMODULE_BRANCH")"
 
@@ -1321,6 +1397,7 @@ clone_submodule_worktree() {
   fi
 
   if remote_branch_exists "$url" "$branch"; then
+    info_echo "克隆分支：$branch"
     run_cmd git clone "${clone_args[@]}" --branch "$branch" --recurse-submodules --jobs="$(get_ncpu)" "$url" "$submodule_path" || return 1
   else
     warn_echo "远端未确认存在分支 $branch，将按远端默认分支 clone：$submodule_path"
@@ -1410,6 +1487,7 @@ sync_one_submodule_to_latest() {
     run_cmd git -C "$submodule_path" config remote.origin.tagOpt --no-tags || true
   fi
 
+  print_git_source "拉取更新" "$submodule_path" "$PWD/$submodule_path" "$url"
   local branch=""
   if ! branch="$(resolve_remote_branch_for_submodule "$submodule_path")"; then
     error_echo "无法确定远端可同步分支：$submodule_path"
@@ -1427,12 +1505,13 @@ sync_one_submodule_to_latest() {
     fetch_args+=(--no-tags)
   fi
 
+  info_echo "拉取分支：origin/$branch"
   run_cmd git -C "$submodule_path" fetch "${fetch_args[@]}" origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" --prune || return 1
   run_cmd git -C "$submodule_path" -c core.quotepath=false checkout -B "$branch" "origin/$branch" || return 1
   run_cmd git -C "$submodule_path" branch --set-upstream-to="origin/$branch" "$branch" >/dev/null 2>&1 || true
   run_cmd git -C "$submodule_path" reset --hard "origin/$branch" || return 1
 
-  sync_submodule_urls_at_repo "$PWD/$submodule_path" "$url" || return 1
+  sync_submodule_urls_at_repo "$PWD/$submodule_path" "$url" 1 || return 1
 
   local -a submodule_update_args
   submodule_update_args=(submodule update --init --recursive --jobs="$(get_ncpu)")
@@ -1447,7 +1526,7 @@ sync_one_submodule_to_latest() {
   # 再次确保子仓是标准 submodule 形态：工作目录下 .git 为单文件，Git 数据由父仓 .git/modules 托管。
   run_cmd git submodule absorbgitdirs -- "$submodule_path" >/dev/null 2>&1 || true
 
-  success_echo "$submodule_path 已浅同步到 origin/$branch：$(git -C "$submodule_path" rev-parse --short HEAD)"
+  success_echo "$submodule_path 已浅同步到 origin/$branch：$(git -C "$submodule_path" rev-parse --short HEAD)（来源：$(safe_git_source_url "$(effective_git_source_url "$PWD/$submodule_path" "$url")")）"
 }
 # 更新并同步 sync selected submodules to latest 对应的目标状态。
 sync_selected_submodules_to_latest() {
