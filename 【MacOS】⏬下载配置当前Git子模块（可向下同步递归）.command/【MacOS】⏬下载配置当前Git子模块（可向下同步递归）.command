@@ -227,7 +227,7 @@ SUBMODULE_REPO_URLS=(
 )
 
 # ============================== 脚本配置（仅维护模式） ==============================
-SUBMODULE_BRANCH="${SUBMODULE_BRANCH:-main}"          # 优先同步的子模块分支；远端没有该分支时自动使用远端默认分支
+SUBMODULE_BRANCH="${SUBMODULE_BRANCH:-main}"          # 维护模式入口父仓分支；子仓读取各层 branch，缺省使用远端默认
 REMOTE_NAME="${REMOTE_NAME:-origin}"                  # 父仓远端名
 DRY_RUN="${DRY_RUN:-0}"                                # 1=只打印动作，不执行
 FORCE_DELETE="${FORCE_DELETE:-0}"                      # 1=显式裁剪时允许删除非 Git 非空旧目录；仍逐仓要求 YES
@@ -1002,14 +1002,14 @@ ensure_parent_branch() {
   fi
 
   if git rev-parse --verify "$b" >/dev/null 2>&1; then
-    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules "$b"
+    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules --no-overwrite-ignore "$b"
     return 0
   fi
 
   if git ls-remote --exit-code --heads "$REMOTE_NAME" "$b" >/dev/null 2>&1; then
-    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules -B "$b" --track "$REMOTE_NAME/$b"
+    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules --no-overwrite-ignore -B "$b" --track "$REMOTE_NAME/$b"
   else
-    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules -B "$b"
+    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules --no-overwrite-ignore -B "$b"
   fi
 }
 # 封装 parent_pull_rebase 对应的独立处理逻辑。
@@ -1054,24 +1054,29 @@ remote_branch_exists() {
   local branch="$2"
   git ls-remote --exit-code --heads "$url" "$branch" >/dev/null 2>&1
 }
-# 封装 remote_branch_for_url 对应的独立处理逻辑。
+# 严格使用显式分支；缺省才查询远端 HEAD，不能静默切换目标。
 remote_branch_for_url() {
   local url="$1"
-  local preferred="$2"
+  local preferred="${2:-}"
   local branch=""
 
-  if remote_branch_exists "$url" "$preferred"; then
+  if [[ -n "$preferred" ]]; then
+    git check-ref-format "refs/heads/$preferred" >/dev/null 2>&1 &&
+      [[ "$preferred" != -* && "$preferred" != HEAD ]] || return 1
+    remote_branch_exists "$url" "$preferred" || return 1
     printf '%s\n' "$preferred"
     return 0
   fi
 
   branch="$(remote_default_branch_by_url "$url")"
   if [[ -n "$branch" ]]; then
+    git check-ref-format "refs/heads/$branch" >/dev/null 2>&1 &&
+      [[ "$branch" != -* && "$branch" != HEAD ]] || return 1
     printf '%s\n' "$branch"
     return 0
   fi
 
-  printf '%s\n' "$preferred"
+  return 1
 }
 # ============================== 子模块状态判断 ==============================
 # 判断目标是否为可用的 Git 工作区。
@@ -1314,17 +1319,15 @@ remove_gitmodules_entry_by_path() {
 # 检查当前运行条件是否满足后续流程要求。
 # 增量补齐缺项，保留已有 URL、分支与扩展字段。
 ensure_gitmodules_entry() {
-  local submodule_path="$1" section="" desired_url="${2:-}" new_section=0
+  local submodule_path="$1" section="" desired_url="${2:-}"
   ensure_gitmodules_file_exists || return 1
   section="$(find_gitmodules_section_by_path "$submodule_path" 2>/dev/null || true)"
   if [[ -z "$section" ]]; then
     section="$submodule_path"
-    new_section=1
   fi
-  local changed=0 cur_path="" cur_url="" cur_branch=""
+  local changed=0 cur_path="" cur_url=""
   cur_path="$(git config -f .gitmodules --get "submodule.$section.path" 2>/dev/null || true)"
   cur_url="$(git config -f .gitmodules --get "submodule.$section.url" 2>/dev/null || true)"
-  cur_branch="$(git config -f .gitmodules --get "submodule.$section.branch" 2>/dev/null || true)"
   if [[ -z "$cur_url" ]]; then
     [[ -n "$desired_url" ]] || desired_url="$(gitmodules_url_for_path "$submodule_path")" || return 1
     if [[ "$desired_url" == ./* || "$desired_url" == ../* ]]; then
@@ -1340,10 +1343,6 @@ ensure_gitmodules_entry() {
   fi
   if [[ -z "$cur_url" ]]; then
     run_cmd git config -f .gitmodules "submodule.$section.url" "$desired_url" || return 1
-    changed=1
-  fi
-  if [[ "$new_section" == 1 && -z "$cur_branch" ]]; then
-    run_cmd git config -f .gitmodules "submodule.$section.branch" "$SUBMODULE_BRANCH" || return 1
     changed=1
   fi
   if [[ "$changed" == 1 ]]; then
@@ -1547,11 +1546,14 @@ restore_cached_submodule_worktree() {
 # 封装 clone_submodule_worktree 对应的独立处理逻辑。
 clone_submodule_worktree() {
   local submodule_path="$1"
-  local url="${2:-}" preferred="${3:-$SUBMODULE_BRANCH}"
+  local url="${2:-}" preferred="${3:-}"
   [[ -n "$url" ]] || url="$(clone_url_for_path "$submodule_path")" || return 1
   print_git_source "首次克隆" "$submodule_path" "$PWD" "$url" clone
   local branch=""
-  branch="$(remote_branch_for_url "$url" "$preferred")" || return 1
+  branch="$(remote_branch_for_url "$url" "$preferred")" || {
+    error_echo "无法确定或获取目标分支，未克隆：$submodule_path（指定：${preferred:-远端默认}；来源：$(safe_git_source_url "$url")）"
+    return 1
+  }
 
   local -a clone_args
   clone_args=()
@@ -1566,13 +1568,8 @@ clone_submodule_worktree() {
 
   validate_submodule_url_path "$PWD" "$submodule_path" || return 1
   run_cmd mkdir -p -- "${submodule_path:h}" || return 1
-  if remote_branch_exists "$url" "$branch"; then
-    info_echo "克隆分支：$branch"
-    run_cmd git -c submodule.recurse=false clone "${clone_args[@]}" --branch "$branch" --no-recurse-submodules -- "$url" "$submodule_path" || return 1
-  else
-    warn_echo "远端未确认存在分支 $branch，将按远端默认分支 clone：$submodule_path"
-    run_cmd git -c submodule.recurse=false clone "${clone_args[@]}" --no-recurse-submodules -- "$url" "$submodule_path" || return 1
-  fi
+  info_echo "克隆分支：$branch"
+  run_cmd git -c submodule.recurse=false clone "${clone_args[@]}" --branch "$branch" --no-recurse-submodules -- "$url" "$submodule_path" || return 1
 
   run_cmd git -C "$submodule_path" config core.quotepath false || true
   if [[ "$SUBMODULE_FETCH_TAGS" != "1" ]]; then
@@ -1582,7 +1579,7 @@ clone_submodule_worktree() {
 # 检查当前运行条件是否满足后续流程要求。
 ensure_submodule_worktree_present() {
   local submodule_path="$1"
-  local url="${2:-}" preferred="${3:-$SUBMODULE_BRANCH}" stage_association="${4:-1}"
+  local url="${2:-}" preferred="${3:-}" stage_association="${4:-1}"
   validate_submodule_url_path "$PWD" "$submodule_path" || {
     error_echo "子仓目录不是安全的相对路径，未初始化或覆盖：$submodule_path"
     return 1
@@ -1638,29 +1635,16 @@ ensure_submodule_worktree_present() {
     return 1
   fi
 }
-# 解析并返回后续流程需要的目标信息。
+# 在子仓自身配置作用域中严格解析目标分支。
 resolve_remote_branch_for_submodule() {
   local submodule_path="$1"
-  local preferred="${2:-$SUBMODULE_BRANCH}"
-
-  if git -C "$submodule_path" ls-remote --exit-code --heads origin "$preferred" >/dev/null 2>&1; then
-    printf '%s\n' "$preferred"
-    return 0
-  fi
-
-  local head_branch=""
-  head_branch="$(git -C "$submodule_path" remote show origin 2>/dev/null | awk '/HEAD branch/ {print $NF}' || true)"
-  if [[ -n "$head_branch" && "$head_branch" != "(unknown)" ]]; then
-    printf '%s\n' "$head_branch"
-    return 0
-  fi
-
-  return 1
+  local preferred="${2:-}"
+  ( cd "$submodule_path" && remote_branch_for_url origin "$preferred" )
 }
 # 执行对应的环境配置或同步处理。
 sync_one_submodule_to_latest() {
   local submodule_path="$1"
-  local url="${2:-}" preferred="${3:-$SUBMODULE_BRANCH}"
+  local url="${2:-}" preferred="${3:-}"
   [[ -n "$url" ]] || url="$(clone_url_for_path "$submodule_path")" || return 1
 
   if [[ ! -e "$submodule_path" ]]; then
@@ -1684,7 +1668,7 @@ sync_one_submodule_to_latest() {
   print_git_source "拉取更新" "$submodule_path" "$PWD/$submodule_path" "$url"
   local branch=""
   if ! branch="$(resolve_remote_branch_for_submodule "$submodule_path" "$preferred")"; then
-    error_echo "无法确定远端可同步分支：$submodule_path"
+    error_echo "无法确定远端可同步分支：$submodule_path（指定：${preferred:-远端默认}；来源：$(safe_git_source_url "$url")）"
     return 1
   fi
 
@@ -1715,10 +1699,10 @@ sync_one_submodule_to_latest() {
       error_echo "目标分支存在独有提交或无法快进，保留现场并停止：$submodule_path（$branch）"
       return 1
     fi
-    run_cmd git -C "$submodule_path" -c submodule.recurse=false checkout --no-recurse-submodules "$branch" || return 1
-    run_cmd git -C "$submodule_path" -c submodule.recurse=false -c "branch.$branch.mergeOptions=" merge --ff-only --no-autostash --no-edit "refs/remotes/origin/$branch" || return 1
+    run_cmd git -C "$submodule_path" -c submodule.recurse=false checkout --no-recurse-submodules --no-overwrite-ignore "$branch" || return 1
+    run_cmd git -C "$submodule_path" -c submodule.recurse=false -c "branch.$branch.mergeOptions=" merge --ff-only --no-autostash --no-overwrite-ignore --no-edit "refs/remotes/origin/$branch" || return 1
   else
-    run_cmd git -C "$submodule_path" -c submodule.recurse=false checkout --no-recurse-submodules -b "$branch" "refs/remotes/origin/$branch" || return 1
+    run_cmd git -C "$submodule_path" -c submodule.recurse=false checkout --no-recurse-submodules --no-overwrite-ignore -b "$branch" "refs/remotes/origin/$branch" || return 1
   fi
   run_cmd git -C "$submodule_path" branch --set-upstream-to="origin/$branch" "$branch" || return 1
   [[ "$(git -C "$submodule_path" symbolic-ref --quiet --short HEAD)" == "$branch" && "$(git -C "$submodule_path" rev-parse HEAD)" == "$(git -C "$submodule_path" rev-parse "refs/remotes/origin/$branch")" ]] || return 1
@@ -1773,8 +1757,7 @@ sync_descendant_submodules_to_latest() (
     if [[ "$branch" == . ]]; then
       branch="$(git symbolic-ref --quiet --short HEAD)" || return 1
     fi
-    branch="${branch:-$SUBMODULE_BRANCH}"
-    info_echo "向下递归：${PWD#"$REPO_ROOT"/}/$child_path（优先分支：$branch）"
+    info_echo "向下递归：${PWD#"$REPO_ROOT"/}/$child_path（目标分支：${branch:-远端默认}）"
     run_cmd git config "submodule.$section.url" "$url" || return 1
     ensure_submodule_worktree_present "$child_path" "$url" "$branch" 0 || return 1
     sync_one_submodule_to_latest "$child_path" "$url" "$branch" || return 1
@@ -1806,7 +1789,6 @@ sync_selected_submodules_to_latest() {
     if [[ "$branch" == . ]]; then
       branch="$(git symbolic-ref --quiet --short HEAD)" || return 1
     fi
-    branch="${branch:-$SUBMODULE_BRANCH}"
     ensure_submodule_worktree_present "$p" "$url" "$branch" || return 1
     sync_one_submodule_to_latest "$p" "$url" "$branch" || return 1
   done
@@ -1975,7 +1957,7 @@ build_submodule_picker_content() {
   - 按 ← 返回上一页
 
 子模块同步 URL 模式: $style（相对地址继承 $REMOTE_NAME；Gitee 标准地址固定 HTTPS）
-子模块分支优先级: $SUBMODULE_BRANCH
+子模块分支: 显式 branch；缺省使用远端默认分支
 子仓浅克隆: $SUBMODULE_SHALLOW_CLONE
 浅克隆深度: $SUBMODULE_DEPTH
 同步 tags: $SUBMODULE_FETCH_TAGS
@@ -2229,7 +2211,7 @@ build_intro_content() {
 脚本目录: $SCRIPT_DIR
 当前目录: $(pwd)
 父仓远端: $REMOTE_NAME
-子模块分支优先级: $SUBMODULE_BRANCH
+子模块分支: 显式 branch；缺省使用远端默认分支
 子模块同步 URL 模式: $style（相对地址继承 $REMOTE_NAME；Gitee 标准地址固定 HTTPS）
 .gitmodules 补缺 URL 模式: $gm_style
 干跑: $DRY_RUN
@@ -2409,6 +2391,7 @@ select_download_operation_mode() {
   initialize_script_paths || return 1
   local answer=""
   print -r -- '================ Git 子模块下载与同步 ================' | jobs_intro_style title
+  print -r -- '同步策略版本：2026.10.21（逐层分支最新，消除游离 HEAD）' | jobs_intro_style body
   print -r -- "目标父仓：$REPO_ROOT" | jobs_intro_style body
   print -r -- '1、只拉取（默认）：更新当前父仓明确上游，再向下同步各层目标分支最新并保持分支态；不暂存、不提交、不推送。' | jobs_intro_style body
   print -r -- '2、维护：保留原清单、分支最新、子树选择和直属深度；登记、提交和推送沿用原开关（默认提交、不推送）。' | jobs_intro_style body
@@ -2435,7 +2418,7 @@ run_embedded_readonly_pull() {
 # - 脚本名称：【MacOS@SourceTree】⏬只拉取远程代码.command
 # - 核心用途：将当前仓库同步到明确的远程上游，逐层检出子模块目标分支的远端最新提交，不提交、不推送。
 # - 影响范围：先 fetch；发现本地改动、未跟踪文件或独有提交时，终端红字列明范围，精确输入 YES 才舍弃。
-# - 保护边界：忽略文件保留；未完成操作、游离 HEAD、上游不明确、子仓风险或忽略文件覆盖风险时停止。
+# - 保护边界：忽略文件保留；游离入口先预检再恢复跟踪分支，独有历史、上游不明确、子仓风险或忽略文件覆盖风险时停止。
 # - 运行提示：SourceTree 只打开 Terminal.app；终端先回车确认，危险操作另需 YES，Ctrl+C 取消。
 
 RAW_SCRIPT_PATH="$0"
@@ -2454,6 +2437,15 @@ TRACKING_REF=""
 SOURCE_URL=""
 EFFECTIVE_URL=""
 ORIGINAL_HEAD=""
+ENTRY_DETACHED=0
+DETACHED_TARGET_HEAD=""
+DETACHED_TARGET_REMOTE_CONFIG=""
+DETACHED_TARGET_MERGE_CONFIG=""
+DETACHED_PARENT_ROOT=""
+DETACHED_PARENT_PATH=""
+DETACHED_PARENT_MANIFEST=""
+DETACHED_PARENT_PIN=""
+DETACHED_PARENT_BRANCH=""
 TARGET_HEAD=""
 WORKTREE_STATE=""
 WORKTREE_FINGERPRINT=""
@@ -2530,6 +2522,7 @@ show_script_intro_and_wait() {
   print -r -- "${COLOR_BLUE}1、同步当前仓库明确的远程上游，再向下检出各子仓目标分支的远端最新提交；不提交、不推送。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}2、先获取远程；本地改动、未跟踪文件和独有提交须精确输入 YES 才舍弃。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}3、子模块按 .gitmodules 分支（缺省为远端默认分支）更新并保持分支态；子仓源码、暂存指针、分叉和独有游离提交均停止。${COLOR_RESET}"
+  print -r -- "${COLOR_BLUE}游离入口：先确定分支并获取远端，检查历史与工作区后才恢复本地跟踪分支；独有历史或脏源码停止。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}4、SourceTree 打开独立终端；回车继续，Ctrl+C 取消；日志：${LOG_FILE}${COLOR_RESET}"
   if (( IS_SOURCETREE_RUNTIME )); then
     open_terminal_for_repository "$@"
@@ -2672,10 +2665,126 @@ assert_repository_ready() {
     [[ "$entry" != [a-zS]' '* ]] || fail '存在 assume-unchanged / skip-worktree（含稀疏检出），请先显式恢复普通工作树。'
   done
 }
-# 仅使用当前分支明确配置的单个远程上游，不猜分支或 origin。
+# 游离入口先按直接父仓清单选分支；独立仓库缺省查询明确远端的 HEAD。
+resolve_detached_entry_upstream() {
+  local keys="" key="" candidate_path="" section="" requested="" result=0 remote_listing="" advertised="" configured_remote="" configured_merge=""
+  ENTRY_DETACHED=1
+  DETACHED_PARENT_ROOT="$(repo_git rev-parse --show-superproject-working-tree)" || fail '无法检查游离入口的直接父仓。'
+  if [[ -n "$DETACHED_PARENT_ROOT" ]]; then
+    DETACHED_PARENT_ROOT="${DETACHED_PARENT_ROOT:A}"
+    DETACHED_PARENT_PATH="${REPOSITORY#"${DETACHED_PARENT_ROOT}/"}"
+    [[ "$DETACHED_PARENT_PATH" != "$REPOSITORY" && -f "${DETACHED_PARENT_ROOT}/.gitmodules" ]] || fail '游离入口缺少有效的直接父仓清单。'
+    DETACHED_PARENT_MANIFEST="$(tree_git "$DETACHED_PARENT_ROOT" hash-object --no-filters -- .gitmodules)" || fail '无法记录直接父仓清单。'
+    DETACHED_PARENT_PIN="$(detached_entry_parent_pin)" || fail '无法记录直接父仓指针。'
+    [[ -n "$DETACHED_PARENT_PIN" ]] || fail '直接父仓索引未登记当前子模块，不能接管游离入口。'
+    keys="$(tree_git "$DETACHED_PARENT_ROOT" config --file "${DETACHED_PARENT_ROOT}/.gitmodules" --name-only --get-regexp '^submodule\..*\.path$')" || result=$?
+    (( result == 0 || result == 1 )) || fail '直接父仓 .gitmodules 无法解析。'
+    for key in "${(@f)keys}"; do
+      [[ -n "$key" ]] || continue
+      candidate_path="$(tree_git "$DETACHED_PARENT_ROOT" config --file "${DETACHED_PARENT_ROOT}/.gitmodules" --get-all "$key")" || fail '无法读取直接父仓子模块路径。'
+      [[ "$candidate_path" == "$DETACHED_PARENT_PATH" ]] || continue
+      [[ -z "$section" ]] || fail '直接父仓对子模块存在重复登记。'
+      section="${key#submodule.}"
+      section="${section%.path}"
+    done
+    [[ -n "$section" ]] || fail '直接父仓清单中找不到当前子仓。'
+    result=0
+    requested="$(tree_git "$DETACHED_PARENT_ROOT" config --file "${DETACHED_PARENT_ROOT}/.gitmodules" --get-all "submodule.${section}.branch")" || result=$?
+    (( result == 0 || result == 1 )) || fail '无法读取直接父仓的目标分支。'
+    [[ "$requested" != *$'\n'* ]] || fail '直接父仓的子模块分支配置不唯一。'
+    if [[ "$requested" == . ]]; then
+      DETACHED_PARENT_BRANCH="$(tree_git "$DETACHED_PARENT_ROOT" symbolic-ref --quiet --short HEAD)" || fail 'branch=. 需要直接父仓位于明确分支。'
+      requested="$DETACHED_PARENT_BRANCH"
+    fi
+  fi
+  BRANCH="$requested"
+  if [[ -n "$BRANCH" ]] && repo_git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+    REMOTE="$(repo_git config --get-all "branch.${BRANCH}.remote")" || fail '游离入口的目标本地分支没有明确远程上游。'
+  elif repo_git config --get-all remote.origin.url >/dev/null; then
+    REMOTE=origin
+  else
+    remote_listing="$(repo_git remote)" || fail '无法读取游离入口的远端。'
+    [[ -n "$remote_listing" && "$remote_listing" != *$'\n'* ]] || fail '游离入口缺少 origin 或唯一远端，不能猜测下载来源。'
+    REMOTE="$remote_listing"
+  fi
+  [[ -n "$REMOTE" && "$REMOTE" != . && "$REMOTE" != -* && "$REMOTE" != *$'\n'* ]] || fail '游离入口必须使用单个明确的远程上游。'
+  SOURCE_URL="$(repo_git config --get-all "remote.${REMOTE}.url")" || fail '游离入口的远程地址未配置。'
+  [[ -n "$SOURCE_URL" && "$SOURCE_URL" != *$'\n'* ]] || fail '游离入口的远程地址必须唯一。'
+  EFFECTIVE_URL="$(repo_git ls-remote --get-url "$REMOTE")" || fail '无法展开游离入口的 Git URL 配置。'
+  if [[ -z "$BRANCH" ]]; then
+    log_message info "游离入口查询远端默认分支；来源：${SOURCE_URL}；拉取地址：${EFFECTIVE_URL}"
+    advertised="$(repo_git ls-remote --symref -- "$REMOTE" HEAD)" || fail '无法查询游离入口的远端默认分支。'
+    BRANCH="$(print -r -- "$advertised" | /usr/bin/awk '$1 == "ref:" && $2 ~ /^refs\/heads\// { sub(/^refs\/heads\//, "", $2); print $2; exit }')"
+    [[ -n "$BRANCH" ]] || fail '远端 HEAD 未指向明确分支；请在直接父仓 .gitmodules 指定 branch。'
+  fi
+  MERGE_REF="refs/heads/${BRANCH}"
+  repo_git check-ref-format "$MERGE_REF" || fail '游离入口目标分支名无效。'
+  [[ "$BRANCH" != -* && "$BRANCH" != HEAD ]] || fail '游离入口目标必须是普通分支。'
+  DETACHED_TARGET_HEAD="$(repo_git rev-parse --verify "refs/heads/${BRANCH}^{commit}" 2>/dev/null)" || DETACHED_TARGET_HEAD=""
+  DETACHED_TARGET_REMOTE_CONFIG="$(repo_git config --get-all "branch.${BRANCH}.remote" 2>/dev/null)" || DETACHED_TARGET_REMOTE_CONFIG=""
+  DETACHED_TARGET_MERGE_CONFIG="$(repo_git config --get-all "branch.${BRANCH}.merge" 2>/dev/null)" || DETACHED_TARGET_MERGE_CONFIG=""
+  if [[ -n "$DETACHED_TARGET_HEAD" ]]; then
+    [[ "$DETACHED_TARGET_REMOTE_CONFIG" == "$REMOTE" && "$DETACHED_TARGET_MERGE_CONFIG" == "$MERGE_REF" ]] || fail '游离入口的目标本地分支必须明确跟踪所选远端的同名分支；请先修复上游配置。'
+    TRACKING_REF="$(repo_git for-each-ref --format='%(upstream)' "refs/heads/${BRANCH}")" || fail '无法解析游离入口目标分支的跟踪引用。'
+    [[ "$TRACKING_REF" == refs/remotes/* && "$TRACKING_REF" != *$'\n'* ]] || fail '游离入口目标分支的远程跟踪映射不明确。'
+  else
+    TRACKING_REF="refs/remotes/${REMOTE}/${BRANCH}"
+  fi
+  log_message info "游离入口已计划恢复跟踪分支：${BRANCH} → ${REMOTE}/${BRANCH}；预检完成前保留原 HEAD。"
+}
+# 父仓索引中的旧 pin 仍保护首次递归下载取得的提交。
+detached_entry_parent_pin() {
+  tree_git "$DETACHED_PARENT_ROOT" --literal-pathspecs ls-files --stage -- "$DETACHED_PARENT_PATH" | /usr/bin/awk '$1 == "160000" && $3 == "0" { print $2; exit }'
+}
+# detached 独有历史和目标本地分支的分叉不接受根仓 YES 舍弃授权。
+assert_detached_entry_history_safe() {
+  (( ENTRY_DETACHED )) || return 0
+  assert_child_head_is_preserved "$REPOSITORY" "$DETACHED_PARENT_PIN" "$TARGET_HEAD"
+  if [[ -n "$DETACHED_TARGET_HEAD" ]]; then
+    repo_git merge-base --is-ancestor "$DETACHED_TARGET_HEAD" "$TARGET_HEAD" || fail '游离入口的目标本地分支存在独有提交或无法快进；保留现场，请先整合。'
+  fi
+}
+# 确认期只核对原现场，不提前切分支或创建本地引用。
+assert_detached_entry_unchanged() {
+  local current_branch="" local_head="" remote_config="" merge_config=""
+  current_branch="$(repo_git symbolic-ref --quiet --short HEAD 2>/dev/null)" || current_branch=""
+  [[ -z "$current_branch" && "$(repo_git rev-parse HEAD)" == "$ORIGINAL_HEAD" ]] || fail '确认期间游离入口 HEAD 或分支已变化，请重新运行。'
+  local_head="$(repo_git rev-parse --verify "refs/heads/${BRANCH}^{commit}" 2>/dev/null)" || local_head=""
+  [[ "$local_head" == "$DETACHED_TARGET_HEAD" ]] || fail '确认期间游离入口的目标本地分支已变化，请重新运行。'
+  remote_config="$(repo_git config --get-all "branch.${BRANCH}.remote" 2>/dev/null)" || remote_config=""
+  merge_config="$(repo_git config --get-all "branch.${BRANCH}.merge" 2>/dev/null)" || merge_config=""
+  [[ "$remote_config" == "$DETACHED_TARGET_REMOTE_CONFIG" && "$merge_config" == "$DETACHED_TARGET_MERGE_CONFIG" ]] || fail '确认期间游离入口的目标分支上游配置已变化。'
+  if [[ -n "$DETACHED_PARENT_ROOT" ]]; then
+    [[ "$(tree_git "$DETACHED_PARENT_ROOT" hash-object --no-filters -- .gitmodules)" == "$DETACHED_PARENT_MANIFEST" && "$(detached_entry_parent_pin)" == "$DETACHED_PARENT_PIN" ]] || fail '确认期间直接父仓清单或子模块指针已变化。'
+    if [[ -n "$DETACHED_PARENT_BRANCH" ]]; then
+      [[ "$(tree_git "$DETACHED_PARENT_ROOT" symbolic-ref --quiet --short HEAD)" == "$DETACHED_PARENT_BRANCH" ]] || fail '确认期间 branch=. 的直接父仓分支已变化。'
+    fi
+  fi
+  assert_detached_entry_history_safe
+}
+# 所有预检通过后才恢复跟踪分支；已存在的分支仅允许快进。
+synchronize_detached_entry() {
+  assert_detached_entry_unchanged
+  if [[ -n "$DETACHED_TARGET_HEAD" ]]; then
+    run_git checkout --no-recurse-submodules --no-overwrite-ignore "$BRANCH" || fail '无法恢复游离入口的目标分支。'
+    run_git -c "branch.${BRANCH}.mergeOptions=" merge --ff-only --no-autostash --no-overwrite-ignore --no-edit "$TARGET_HEAD" || fail '游离入口的目标分支无法快进。'
+  else
+    run_git checkout --no-recurse-submodules --no-overwrite-ignore -b "$BRANCH" "$TARGET_HEAD" || fail '无法创建游离入口的跟踪分支。'
+    if [[ "$(repo_git -c "branch.${BRANCH}.remote=${REMOTE}" -c "branch.${BRANCH}.merge=${MERGE_REF}" rev-parse --symbolic-full-name "${BRANCH}@{upstream}" 2>/dev/null)" != "$TRACKING_REF" ]]; then
+      run_git config --local --add "remote.${REMOTE}.fetch" "+${MERGE_REF}:${TRACKING_REF}" || fail '无法补齐游离入口的目标分支映射。'
+    fi
+    run_git branch --set-upstream-to="${REMOTE}/${BRANCH}" "$BRANCH" || fail '无法设置游离入口分支上游。'
+  fi
+  [[ "$(repo_git symbolic-ref --quiet --short HEAD)" == "$BRANCH" && "$(repo_git rev-parse HEAD)" == "$TARGET_HEAD" ]] || fail '游离入口恢复后的分支或提交核验失败。'
+}
+# 正常分支沿用明确上游；游离入口先计划恢复，不提前修改工作树。
 resolve_upstream() {
-  BRANCH="$(repo_git symbolic-ref --quiet --short HEAD)" || fail '当前是游离 HEAD，请先在 SourceTree 切换到已有的跟踪分支。'
-  ORIGINAL_HEAD="$(repo_git rev-parse --verify HEAD)" || fail '当前分支没有有效提交。'
+  ORIGINAL_HEAD="$(repo_git rev-parse --verify HEAD)" || fail '当前仓库没有有效提交。'
+  BRANCH="$(repo_git symbolic-ref --quiet --short HEAD 2>/dev/null)" || BRANCH=""
+  if [[ -z "$BRANCH" ]]; then
+    resolve_detached_entry_upstream
+    return
+  fi
   REMOTE="$(repo_git config --get-all "branch.${BRANCH}.remote")" || fail '当前分支没有配置远程上游。'
   MERGE_REF="$(repo_git config --get-all "branch.${BRANCH}.merge")" || fail '当前分支没有配置上游分支。'
   [[ -n "$REMOTE" && "$REMOTE" != . && "$REMOTE" != -* && "$REMOTE" != *$'\n'* ]] || fail '只支持一个明确的远程上游。'
@@ -2697,6 +2806,7 @@ fetch_target() {
   run_git fetch --no-tags --no-recurse-submodules -- "$REMOTE" "+${MERGE_REF}:${TRACKING_REF}" || fail '远程获取失败，未舍弃本地内容。'
   TARGET_HEAD="$(repo_git rev-parse --verify "${TRACKING_REF}^{commit}")" || fail '远程目标不是有效提交。'
   log_message info "本次固定目标：${TARGET_HEAD}"
+  assert_detached_entry_history_safe
 }
 # 完整检查可能被覆盖或清理的目录，枚举失败也必须停止。
 assert_directory_has_no_nested_git() {
@@ -3044,10 +3154,10 @@ synchronize_submodule_plan() {
       assert_child_worktree_ready "$child_root" "$target_pin"
       assert_child_branch_unchanged "$index"
       if [[ -n "${PLAN_LOCAL_HEADS[$index]}" ]]; then
-        run_tree_git "$child_root" checkout --no-recurse-submodules "$branch" || fail "无法切回子仓分支：${child_root}"
-        run_tree_git "$child_root" -c "branch.${branch}.mergeOptions=" merge --ff-only --no-autostash --no-edit "$target_pin" || fail "子仓分支无法快进：${child_root}"
+        run_tree_git "$child_root" checkout --no-recurse-submodules --no-overwrite-ignore "$branch" || fail "无法切回子仓分支：${child_root}"
+        run_tree_git "$child_root" -c "branch.${branch}.mergeOptions=" merge --ff-only --no-autostash --no-overwrite-ignore --no-edit "$target_pin" || fail "子仓分支无法快进：${child_root}"
       else
-        run_tree_git "$child_root" checkout --no-recurse-submodules -b "$branch" "$target_pin" || fail "无法建立子仓跟踪分支：${child_root}"
+        run_tree_git "$child_root" checkout --no-recurse-submodules --no-overwrite-ignore -b "$branch" "$target_pin" || fail "无法建立子仓跟踪分支：${child_root}"
       fi
     else
       assert_new_submodule_path_empty "$child_root"
@@ -3127,6 +3237,11 @@ capture_worktree_fingerprint() {
 review_local_risk() {
   WORKTREE_STATE="$(repo_git status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" || fail '无法检查工作区。'
   LOCAL_ONLY_COUNT="$(repo_git rev-list --count "${TARGET_HEAD}..HEAD")" || fail '无法检查本地独有提交。'
+  if (( ENTRY_DETACHED )); then
+    [[ -z "$WORKTREE_STATE" ]] || fail '游离入口存在暂存 / 未暂存 / 未跟踪源码；请先处理后再恢复分支。'
+    assert_detached_entry_history_safe
+    LOCAL_ONLY_COUNT=0
+  fi
   WORKTREE_FINGERPRINT="$(capture_worktree_fingerprint)" || fail '无法建立工作区内容摘要。'
   if [[ -n "$WORKTREE_STATE" || "$LOCAL_ONLY_COUNT" != 0 ]]; then
     log_message danger '⚠ 高危：继续将永久舍弃以下本地内容；不生成 stash 或备份。'
@@ -3152,8 +3267,12 @@ review_local_risk() {
 # 用户确认后重新核对 HEAD、分支、配置及路径，避免沿用失效计划。
 assert_plan_unchanged() {
   assert_repository_ready
-  [[ "$(repo_git symbolic-ref --quiet --short HEAD)" == "$BRANCH" && "$(repo_git rev-parse HEAD)" == "$ORIGINAL_HEAD" ]] || fail '确认期间分支或 HEAD 已变化，请重新运行。'
-  [[ "$(repo_git config --get-all "branch.${BRANCH}.remote")" == "$REMOTE" && "$(repo_git config --get-all "branch.${BRANCH}.merge")" == "$MERGE_REF" ]] || fail '确认期间上游配置已变化，请重新运行。'
+  if (( ENTRY_DETACHED )); then
+    assert_detached_entry_unchanged
+  else
+    [[ "$(repo_git symbolic-ref --quiet --short HEAD)" == "$BRANCH" && "$(repo_git rev-parse HEAD)" == "$ORIGINAL_HEAD" ]] || fail '确认期间分支或 HEAD 已变化，请重新运行。'
+    [[ "$(repo_git config --get-all "branch.${BRANCH}.remote")" == "$REMOTE" && "$(repo_git config --get-all "branch.${BRANCH}.merge")" == "$MERGE_REF" ]] || fail '确认期间上游配置已变化，请重新运行。'
+  fi
   [[ "$(repo_git status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" == "$WORKTREE_STATE" ]] || fail '确认期间工作区状态已变化，请重新运行。'
   [[ "$(capture_worktree_fingerprint)" == "$WORKTREE_FINGERPRINT" ]] || fail '确认期间文件内容已变化，请重新运行并重新确认。'
   [[ "$(repo_git config --get-all "remote.${REMOTE}.url")" == "$SOURCE_URL" ]] || fail '确认期间远程来源已变化，请重新运行。'
@@ -3164,11 +3283,13 @@ assert_plan_unchanged() {
 # 干净分支仅快进；有明确 YES 授权时才 reset 和清理非忽略内容。
 synchronize_repository() {
   SYNC_STARTED=1
-  if [[ -n "$WORKTREE_STATE" || "$LOCAL_ONLY_COUNT" != 0 ]]; then
+  if (( ENTRY_DETACHED )); then
+    synchronize_detached_entry
+  elif [[ -n "$WORKTREE_STATE" || "$LOCAL_ONLY_COUNT" != 0 ]]; then
     run_git reset --hard --no-recurse-submodules "$TARGET_HEAD" || fail '重置失败，已停止；请检查工作区与日志。'
     run_git clean -fd || fail '清理失败，已停止；请检查工作区与日志。'
   elif [[ "$ORIGINAL_HEAD" != "$TARGET_HEAD" ]]; then
-    run_git -c "branch.${BRANCH}.mergeOptions=" merge --ff-only --no-autostash --no-edit "$TARGET_HEAD" || fail '无法安全快进，已停止。'
+    run_git -c "branch.${BRANCH}.mergeOptions=" merge --ff-only --no-autostash --no-overwrite-ignore --no-edit "$TARGET_HEAD" || fail '无法安全快进，已停止。'
   fi
   [[ "$(repo_git rev-parse HEAD)" == "$TARGET_HEAD" ]] || fail '同步后提交号核验失败。'
   synchronize_submodule_plan
