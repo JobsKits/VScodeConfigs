@@ -5,6 +5,7 @@
 # - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS，递归子模块继承，不写全局配置。
 # - 核心用途：回车默认只拉取明确上游并递归同步子仓分支最新；维护模式保留各仓清单、分支最新和登记流程。
 # - 影响范围：只拉取不暂存、不提交、不推送；维护模式沿用父仓登记、索引和提交开关。
+# - 文档目录：已配置目录过滤器才执行本仓 restore / verify，无配置跳过，不自动安装。
 # - 运行提示：先选择只拉取或维护，再阅读对应自述并回车确认；危险舍弃另需精确 YES，Ctrl+C 取消。
 
 # 仅渲染自述：标题红色加粗，编号正文蓝色常规字重；非彩色终端输出纯文本。
@@ -331,6 +332,59 @@ print_git_source() {
   source_highlight_echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 }
 
+# 只还原已配置的目录过滤器；无配置不安装，保留当前正文与暂存内容。
+restore_configured_markdown_toc() {
+  local toc_root="${1:A}" toc_smudge="" toc_process="" toc_node="" toc_result=0
+  toc_smudge="$(command git -C "$toc_root" config --get filter.jobs-markdown-toc.smudge)" || toc_result=$?
+  if (( toc_result > 1 )); then
+    print -u2 -r -- "无法读取 Markdown 目录过滤器，保留现场：${toc_root}"
+    return 1
+  fi
+  toc_result=0
+  toc_process="$(command git -C "$toc_root" config --get filter.jobs-markdown-toc.process)" || toc_result=$?
+  if (( toc_result > 1 )) || [[ -n "$toc_process" ]]; then
+    print -u2 -r -- "Markdown 目录 process 配置冲突或读取失败，保留现场：${toc_root}"
+    return 1
+  fi
+  if [[ -z "$toc_smudge" ]]; then
+    print -r -- "Markdown 目录：未配置还原过滤器，跳过：${toc_root}"
+    return 0
+  fi
+  # 还原不跨越未完成的合并、冲突或其它 Git 写操作。
+  local toc_marker="" toc_marker_path="" toc_unmerged=""
+  for toc_marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer BISECT_START index.lock; do
+    toc_marker_path="$(command git -C "$toc_root" rev-parse --git-path "$toc_marker")" || return 1
+    [[ "$toc_marker_path" == /* ]] || toc_marker_path="${toc_root}/${toc_marker_path}"
+    if [[ -e "$toc_marker_path" ]]; then
+      print -u2 -r -- "存在未完成 Git 操作或锁，未还原目录：${toc_root}（${toc_marker}）"
+      return 1
+    fi
+  done
+  toc_unmerged="$(command git -C "$toc_root" ls-files --unmerged)" || return 1
+  if [[ -n "$toc_unmerged" ]]; then
+    print -u2 -r -- "索引存在未解决冲突，未还原目录：${toc_root}"
+    return 1
+  fi
+  local toc_tool="${toc_root}/.jobs-markdown-toc/MarkdownToc.mjs"
+  if [[ ! -f "$toc_tool" || -L "$toc_tool" || -L "${toc_tool:h}" ]]; then
+    print -u2 -r -- "已配置 Markdown 目录过滤器，但缺少本仓安全还原工具，停止：${toc_tool}"
+    return 1
+  fi
+  # 优先使用过滤器已登记的 Node 路径，不求值或执行配置中的 Shell 文本。
+  local -a toc_words
+  toc_words=(${(z)toc_smudge})
+  toc_node="${(Q)toc_words[1]}"
+  if [[ "$toc_node" != /* || "${toc_node:t}" != node || ! -x "$toc_node" ]]; then
+    toc_node="$(command -v node 2>/dev/null)" || toc_node=""
+  fi
+  if [[ -z "$toc_node" || ! -x "$toc_node" ]]; then
+    print -u2 -r -- "已配置 Markdown 目录过滤器，但 Node.js 不可用；未安装或改写配置：${toc_root}"
+    return 1
+  fi
+  print -r -- "Markdown 目录：执行已配置过滤器的本仓还原与检查：${toc_root}"
+  "$toc_node" "$toc_tool" restore || return 1
+  "$toc_node" "$toc_tool" verify
+}
 # 执行已经拆分完成的独立业务步骤。
 run_cmd() {
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -1171,6 +1225,9 @@ submodule_children_for_protection() {
 assert_clean_submodule() {
   local submodule_path="$1" action="$2" children="" current_children="" child_path=""
   is_git_worktree "$submodule_path" || return 0
+  if [[ "$action" == 更新 || "$action" == 纳入子模块 ]]; then
+    run_cmd restore_configured_markdown_toc "$submodule_path" 2>&1 | tee -a "$LOG_FILE" || return 1
+  fi
   if [[ "$SUBMODULE_RECURSIVE" == 1 ]]; then
     children="$(submodule_children_for_protection "$submodule_path")" || return 1
   fi
@@ -1611,6 +1668,8 @@ ensure_submodule_worktree_present() {
     clone_submodule_worktree "$submodule_path" "$url" "$preferred" || return 1
   fi
 
+  run_cmd restore_configured_markdown_toc "$submodule_path" 2>&1 | tee -a "$LOG_FILE" || return 1
+
   # 不使用 git submodule add，避免 .gitmodules 被 Git 自动重写；手动 add 会把内部 Git 仓登记为 gitlink。
   if [[ "$stage_association" == 1 ]]; then
     run_cmd git --literal-pathspecs add -- .gitmodules "$submodule_path" || return 1
@@ -1706,6 +1765,8 @@ sync_one_submodule_to_latest() {
   fi
   run_cmd git -C "$submodule_path" branch --set-upstream-to="origin/$branch" "$branch" || return 1
   [[ "$(git -C "$submodule_path" symbolic-ref --quiet --short HEAD)" == "$branch" && "$(git -C "$submodule_path" rev-parse HEAD)" == "$(git -C "$submodule_path" rev-parse "refs/remotes/origin/$branch")" ]] || return 1
+
+  run_cmd restore_configured_markdown_toc "$submodule_path" 2>&1 | tee -a "$LOG_FILE" || return 1
 
   if [[ "$SUBMODULE_RECURSIVE" == 1 ]] && ! sync_descendant_submodules_to_latest "$PWD/$submodule_path" "$url"; then
     error_echo "递归子模块同步失败：$submodule_path；未标记为同步成功。"
@@ -2312,6 +2373,7 @@ show_script_intro_and_wait() {
   print -r -- '递归边界：从运行脚本对应仓库向下，仅处理所选子树，各层读取自己的 .gitmodules；不向上处理。' | jobs_intro_style body
   print -r -- '影响范围：父仓登记和提交指针、子仓代码与分支；默认自动提交父仓，不自动推送。' | jobs_intro_style body
   print -r -- '同步策略：全量按清单逐仓处理；已有子仓复用更新，空目录首次初始化，不删除已有子树或旧仓名目录。' | jobs_intro_style body
+  print -r -- '文档目录：有已配置的目录过滤器才执行本仓 restore / verify；无配置跳过，不自动安装。' | jobs_intro_style body
   print -r -- '关键风险：分支会对齐远端最新；未提交内容红字加粗标明仓库，循环等待 YES 放弃当前仓改动，或在外部处理后按回车复检。' | jobs_intro_style body
   print -r -- "日志文件：$LOG_FILE" | jobs_intro_style body
   print -r -- '取消方式：按 Ctrl+C 终止；自述确认前不执行真实业务。' | jobs_intro_style body
@@ -2341,13 +2403,15 @@ prepare_parent_repository() {
   cd_to_script_dir || return 1 # 以当前入口推导的父仓根目录作为全部相对路径基准。
   load_configured_submodules || return 1 # 保留各仓独立清单与已有共享登记。
   ensure_repo_initialized || return 1 # 拒绝非仓库或位于错误层级的目录。
+  run_cmd restore_configured_markdown_toc "$REPO_ROOT" 2>&1 | tee -a "$LOG_FILE" || return 1 # 有过滤器才恢复当前目录标签。
   configure_gitee_https_transport || return 1 # 在首次联网前配置当前进程的 Gitee HTTPS 规则。
   ensure_git_remote "$REMOTE_NAME" || return 1 # 检查所选父仓远端并显示实际线路。
 }
 # 保留既有分支选择及父仓拉取策略。
 synchronize_parent_repository() {
   ensure_parent_branch || return 1 # 确认当前父仓分支后再拉取。
-  parent_pull_rebase # 父仓有未提交改动时按既有策略跳过拉取。
+  parent_pull_rebase || return 1 # 父仓有未提交改动时按既有策略跳过拉取。
+  run_cmd restore_configured_markdown_toc "$REPO_ROOT" 2>&1 | tee -a "$LOG_FILE" || return 1 # 无更新拉取也检查已配置的还原流程。
 }
 # 创建当前运行的菜单预览文件，并在退出时回收。
 prepare_preview_runtime() {
@@ -2391,7 +2455,7 @@ select_download_operation_mode() {
   initialize_script_paths || return 1
   local answer=""
   print -r -- '================ Git 子模块下载与同步 ================' | jobs_intro_style title
-  print -r -- '同步策略版本：2026.10.21（逐层分支最新，消除游离 HEAD）' | jobs_intro_style body
+  print -r -- '同步策略版本：2026.10.21-toc（分支最新；有目录过滤器才还原）' | jobs_intro_style body
   print -r -- "目标父仓：$REPO_ROOT" | jobs_intro_style body
   print -r -- '1、只拉取（默认）：更新当前父仓明确上游，再向下同步各层目标分支最新并保持分支态；不暂存、不提交、不推送。' | jobs_intro_style body
   print -r -- '2、维护：保留原清单、分支最新、子树选择和直属深度；登记、提交和推送沿用原开关（默认提交、不推送）。' | jobs_intro_style body
@@ -2523,7 +2587,8 @@ show_script_intro_and_wait() {
   print -r -- "${COLOR_BLUE}2、先获取远程；本地改动、未跟踪文件和独有提交须精确输入 YES 才舍弃。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}3、子模块按 .gitmodules 分支（缺省为远端默认分支）更新并保持分支态；子仓源码、暂存指针、分叉和独有游离提交均停止。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}游离入口：先确定分支并获取远端，检查历史与工作区后才恢复本地跟踪分支；独有历史或脏源码停止。${COLOR_RESET}"
-  print -r -- "${COLOR_BLUE}4、SourceTree 打开独立终端；回车继续，Ctrl+C 取消；日志：${LOG_FILE}${COLOR_RESET}"
+  print -r -- "${COLOR_BLUE}4、已配置目录过滤器的仓库执行本仓 restore / verify；无配置跳过，不自动安装。${COLOR_RESET}"
+  print -r -- "${COLOR_BLUE}5、SourceTree 打开独立终端；回车继续，Ctrl+C 取消；日志：${LOG_FILE}${COLOR_RESET}"
   if (( IS_SOURCETREE_RUNTIME )); then
     open_terminal_for_repository "$@"
     exit $?
@@ -2599,6 +2664,63 @@ fail() {
   (( ! SYNC_STARTED )) || log_message danger '部分仓库可能已经检出目标；未创建提交或推送。请按日志处理后重新运行，不能将本次视为完成。'
   log_message info "日志：${LOG_FILE}"
   exit 1
+}
+# 只还原已配置的目录过滤器；无配置不安装，保留当前正文与暂存内容。
+restore_configured_markdown_toc() {
+  local toc_root="${1:A}" toc_smudge="" toc_process="" toc_node="" toc_result=0
+  toc_smudge="$(command git -C "$toc_root" config --get filter.jobs-markdown-toc.smudge)" || toc_result=$?
+  if (( toc_result > 1 )); then
+    print -u2 -r -- "无法读取 Markdown 目录过滤器，保留现场：${toc_root}"
+    return 1
+  fi
+  toc_result=0
+  toc_process="$(command git -C "$toc_root" config --get filter.jobs-markdown-toc.process)" || toc_result=$?
+  if (( toc_result > 1 )) || [[ -n "$toc_process" ]]; then
+    print -u2 -r -- "Markdown 目录 process 配置冲突或读取失败，保留现场：${toc_root}"
+    return 1
+  fi
+  if [[ -z "$toc_smudge" ]]; then
+    print -r -- "Markdown 目录：未配置还原过滤器，跳过：${toc_root}"
+    return 0
+  fi
+  # 还原不跨越未完成的合并、冲突或其它 Git 写操作。
+  local toc_marker="" toc_marker_path="" toc_unmerged=""
+  for toc_marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer BISECT_START index.lock; do
+    toc_marker_path="$(command git -C "$toc_root" rev-parse --git-path "$toc_marker")" || return 1
+    [[ "$toc_marker_path" == /* ]] || toc_marker_path="${toc_root}/${toc_marker_path}"
+    if [[ -e "$toc_marker_path" ]]; then
+      print -u2 -r -- "存在未完成 Git 操作或锁，未还原目录：${toc_root}（${toc_marker}）"
+      return 1
+    fi
+  done
+  toc_unmerged="$(command git -C "$toc_root" ls-files --unmerged)" || return 1
+  if [[ -n "$toc_unmerged" ]]; then
+    print -u2 -r -- "索引存在未解决冲突，未还原目录：${toc_root}"
+    return 1
+  fi
+  local toc_tool="${toc_root}/.jobs-markdown-toc/MarkdownToc.mjs"
+  if [[ ! -f "$toc_tool" || -L "$toc_tool" || -L "${toc_tool:h}" ]]; then
+    print -u2 -r -- "已配置 Markdown 目录过滤器，但缺少本仓安全还原工具，停止：${toc_tool}"
+    return 1
+  fi
+  # 优先使用过滤器已登记的 Node 路径，不求值或执行配置中的 Shell 文本。
+  local -a toc_words
+  toc_words=(${(z)toc_smudge})
+  toc_node="${(Q)toc_words[1]}"
+  if [[ "$toc_node" != /* || "${toc_node:t}" != node || ! -x "$toc_node" ]]; then
+    toc_node="$(command -v node 2>/dev/null)" || toc_node=""
+  fi
+  if [[ -z "$toc_node" || ! -x "$toc_node" ]]; then
+    print -u2 -r -- "已配置 Markdown 目录过滤器，但 Node.js 不可用；未安装或改写配置：${toc_root}"
+    return 1
+  fi
+  print -r -- "Markdown 目录：执行已配置过滤器的本仓还原与检查：${toc_root}"
+  "$toc_node" "$toc_tool" restore || return 1
+  "$toc_node" "$toc_tool" verify
+}
+# 把入口仓恢复日志纳入当前只拉取日志，失败交给主流程停止。
+restore_entry_markdown_toc() {
+  restore_configured_markdown_toc "$REPOSITORY" 2>&1 | sanitize_stream | /usr/bin/tee -a "$LOG_FILE" || fail '入口仓 Markdown 目录还原失败。'
 }
 # 所有 Git 操作禁用递归和本地钩子，避免一次拉取扩展业务范围。
 repo_git() {
@@ -3076,6 +3198,7 @@ prepare_descendant_plan() {
       [[ -n "$old_pin" ]] || fail "新增 gitlink 路径已有独立 Git，不能接管：${child_root}"
       child_head="$(tree_git "$child_root" rev-parse --verify HEAD)" || fail "子模块 Git 指针损坏：${child_root}"
       child_branch="$(tree_git "$child_root" symbolic-ref --quiet HEAD 2>/dev/null)" || child_branch=""
+      restore_configured_markdown_toc "$child_root" 2>&1 | sanitize_stream | /usr/bin/tee -a "$LOG_FILE" || fail "子仓 Markdown 目录还原失败：${child_root}"
       assert_child_worktree_ready "$child_root" "$child_head"
     else
       assert_new_submodule_path_empty "$child_root"
@@ -3162,10 +3285,13 @@ synchronize_submodule_plan() {
     else
       assert_new_submodule_path_empty "$child_root"
       log_message info "首次克隆已预检分支：${child_root} → ${branch}；来源：${PLAN_URLS[$index]}"
-      # 从预检对象库复制，避免二次联网期间远端移动导致检出未经预检的树；不保留共享对象依赖。
-      run_tree_git "$parent_root" clone --no-local --single-branch --branch "$branch" --origin "$remote_name" --no-recurse-submodules -- "${PLAN_OBJECT_REPOS[$index]}" "$child_root" || fail "子模块分支克隆失败：${child_root}"
+      # 先复制已预检对象但不写工作树，登记真实远端后才让条件过滤器参与首次检出。
+      run_tree_git "$parent_root" clone --no-checkout --no-local --single-branch --branch "$branch" --origin "$remote_name" --no-recurse-submodules -- "${PLAN_OBJECT_REPOS[$index]}" "$child_root" || fail "子模块分支克隆失败：${child_root}"
     fi
     run_tree_git "$child_root" remote set-url "$remote_name" "${PLAN_URLS[$index]}" || fail "无法记录子仓下载来源：${child_root}"
+    if [[ -z "${PLAN_ORIGINAL_HEADS[$index]}" ]]; then
+      run_tree_git "$child_root" checkout --no-recurse-submodules --no-overwrite-ignore "$branch" || fail "子仓首次检出失败：${child_root}"
+    fi
     # 保留已有宽映射和其它分支；仅在目标缺少有效上游映射时补一条精确 refspec。
     if [[ "$(tree_git "$child_root" -c "branch.${branch}.remote=${remote_name}" -c "branch.${branch}.merge=refs/heads/${branch}" rev-parse --symbolic-full-name "${branch}@{upstream}" 2>/dev/null)" != "refs/remotes/${remote_name}/${branch}" ]]; then
       run_tree_git "$child_root" config --local --add "remote.${remote_name}.fetch" "+refs/heads/${branch}:refs/remotes/${remote_name}/${branch}" || fail "无法配置子仓分支映射：${child_root}"
@@ -3176,6 +3302,7 @@ synchronize_submodule_plan() {
     run_tree_git "$parent_root" config --local "submodule.${PLAN_SECTIONS[$index]}.active" true || fail "无法激活子模块登记：${child_root}"
     run_tree_git "$parent_root" --literal-pathspecs submodule absorbgitdirs -- "$child_path" || fail "无法归集子模块元数据：${child_root}"
     [[ "$(tree_git "$child_root" symbolic-ref --quiet --short HEAD)" == "$branch" && "$(tree_git "$child_root" rev-parse HEAD)" == "$target_pin" ]] || fail "子模块分支或最新提交核验失败：${child_root}"
+    restore_configured_markdown_toc "$child_root" 2>&1 | sanitize_stream | /usr/bin/tee -a "$LOG_FILE" || fail "子仓 Markdown 目录还原失败：${child_root}"
     log_message success "✔ 子模块已同步分支最新：${child_root} → ${remote_name}/${branch}（${target_pin}）；来源：${PLAN_URLS[$index]}"
   done
 }
@@ -3292,6 +3419,7 @@ synchronize_repository() {
     run_git -c "branch.${BRANCH}.mergeOptions=" merge --ff-only --no-autostash --no-overwrite-ignore --no-edit "$TARGET_HEAD" || fail '无法安全快进，已停止。'
   fi
   [[ "$(repo_git rev-parse HEAD)" == "$TARGET_HEAD" ]] || fail '同步后提交号核验失败。'
+  restore_entry_markdown_toc
   synchronize_submodule_plan
   [[ -z "$(repo_git status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]] || fail '同步后仍有本地变化，未标记成功。'
   log_message success "✔ 已同步：${BRANCH} → ${TARGET_HEAD}"
@@ -3304,6 +3432,7 @@ main() {
   initialize_runtime # 确认后建立私有日志与退出清理。
   resolve_repository "$@" # 校验目标并防止同一动作并行运行。
   assert_repository_ready # 未完成 Git 操作和隐藏状态先停止。
+  restore_entry_markdown_toc # 已配置才还原当前文档，无配置不安装。
   resolve_upstream # 仅使用当前分支明确配置的远程上游。
   fetch_target # 成功获取并固定提交后才考虑舍弃。
   assert_nested_repositories_safe # 预检各层最新分支，保护子仓和嵌套仓库。
