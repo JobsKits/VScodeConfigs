@@ -1983,6 +1983,7 @@ add_new_git_url_interactive() {
 
     validate_remote_access_or_loop_continue "$clone_url" || continue
 
+    synchronize_parent_repository || return 1
     SUBMODULE_REPO_URLS+=("$input|$local_path")
     append_runtime_submodule "$page_url" "$https_url" "$ssh_url" "$repo_name" "$local_path"
     ensure_gitmodules_entry "$local_path" "$input" || continue
@@ -2008,13 +2009,13 @@ build_submodule_picker_content() {
   style="$(detect_git_url_style 2>/dev/null || echo https)"
 
   cat <<EOF2
-📦 选择指定子模块同步（OpenClaw 键盘版，非 fzf 多选页）
+📦 选择指定子模块同步（fzf 多选）
 ------------------------------------------------------------
 操作说明：
   - 按 ↑ / ↓ 移动光标
   - 按 [回车 Enter] 勾选 / 取消勾选当前项目
   - 最后按【空格键 Space】确认当前勾选并开始同步（无需再按回车）
-  - 第一项“全选”会一次勾选 / 取消全部 SUBMODULE_REPO_URLS 项目
+  - Ctrl+A 全选，Ctrl+D 清空，Esc 取消脚本；空选不会启动同步
   - 按 ← 返回上一页
 
 子模块同步 URL 模式: $style（相对地址继承 $REMOTE_NAME；Gitee 标准地址固定 HTTPS）
@@ -2027,197 +2028,61 @@ build_submodule_picker_content() {
 ------------------------------------------------------------
 EOF2
 }
-# 封装 submodule_picker_all_selected 对应的独立处理逻辑。
-submodule_picker_all_selected() {
-  local p=""
-
-  [[ ${#CONFIG_PATHS[@]} -gt 0 ]] || return 1
-
-  for p in "${CONFIG_PATHS[@]}"; do
-    [[ -n "${SUBMODULE_PICKED[$p]:-}" ]] || return 1
-  done
-
-  return 0
-}
-# 封装 render_submodule_keyboard_picker 对应的独立处理逻辑。
-render_submodule_keyboard_picker() {
-  local cursor="$1"
-  local message="${2:-}"
-  local total=$(( ${#CONFIG_PATHS[@]} + 1 ))
-  local i=1
-  local pointer=""
-  local mark=""
-  local p=""
-  local display_path=""
-  local page_url=""
-
-  command clear 2>/dev/null || printf '\033[2J\033[H'
-  build_submodule_picker_content
-
-  if [[ -n "$message" ]]; then
-    printf '%s\n' "$message"
-    printf '%s\n' '------------------------------------------------------------'
-  fi
-
-  while [[ $i -le $total ]]; do
-    if [[ $i -eq $cursor ]]; then
-      pointer="👉"
-    else
-      pointer="  "
-    fi
-
-    if [[ $i -eq 1 ]]; then
-      if submodule_picker_all_selected; then
-        mark="✅"
-      else
-        mark="⬜️"
-      fi
-      printf '%s %s %s\n' "$pointer" "$mark" "全选：同步 SUBMODULE_REPO_URLS 中全部项目"
-    else
-      p="${CONFIG_PATHS[$(( i - 1 ))]}"
-      display_path="$(preview_safe_text "$p")"
-      page_url="$(repo_page_by_path "$p" 2>/dev/null || true)"
-      if [[ -n "${SUBMODULE_PICKED[$p]:-}" ]]; then
-        mark="✅"
-      else
-        mark="⬜️"
-      fi
-      printf '%s %s %s    %s\n' "$pointer" "$mark" "$display_path" "$page_url"
-    fi
-
-    (( i++ ))
-  done
-
-  printf '%s\n' '------------------------------------------------------------'
-  printf '已勾选：%s / %s\n' "${#SUBMODULE_PICKED[@]}" "${#CONFIG_PATHS[@]}"
-  printf '%s\n' '操作：↑/↓ 移动，回车(Enter) 勾选/取消，← 返回上一页'
-  printf '%s\n' '👉 最后按【空格键 Space】确认已勾选项目并开始同步（无需再按回车）。'
-}
-# 封装 read_submodule_picker_key 对应的独立处理逻辑。
-read_submodule_picker_key() {
-  local key=""
-  local rest=""
-  local ch=""
-  local guard=0
-
-  SUBMODULE_PICKER_KEY=""
-  IFS= read -rs -k 1 key || return 1
-
-  # 方向键是 ESC 开头的转义序列。不能只读固定 2 个字符，
-  # 否则某些终端发出的扩展序列会被截断，导致 ← 识别失败。
-  if [[ "$key" == $'\e' ]]; then
-    rest=""
-    while IFS= read -rs -t 0.03 -k 1 ch; do
-      rest+="$ch"
-      (( guard++ ))
-      [[ $guard -ge 8 ]] && break
-    done
-    key+="$rest"
-  fi
-
-  SUBMODULE_PICKER_KEY="$key"
-}
 # 收集并校验用户输入，决定后续执行路径。
 select_configured_submodules_interactive() {
   local preview_file="$1"
+  local selected="" picker_result=0 payload="" p=""
+  local -a selected_paths
+  selected_paths=()
 
   if [[ ${#CONFIG_PATHS[@]} -eq 0 ]]; then
     warn_echo "SUBMODULE_REPO_URLS 当前没有配置任何项目"
     return 2
   fi
 
-  typeset -gA SUBMODULE_PICKED
-  SUBMODULE_PICKED=()
-  local cursor=1
-  local total=$(( ${#CONFIG_PATHS[@]} + 1 ))
-  local message=""
-  local key=""
-  local p=""
-
-  while true; do
-    render_submodule_keyboard_picker "$cursor" "$message"
-    message=""
-
-    if ! read_submodule_picker_key; then
-      note_echo "已取消选择，返回上一页"
-      return 2
+  build_submodule_picker_content > "$preview_file"
+  selected="$(printf '%s\n' "${CONFIG_PATHS[@]}" |
+    FZF_CONFIG_PREVIEW_FILE="$preview_file" FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf \
+      --multi --height=100% --border --reverse \
+      --prompt='选择子模块 > ' --expect=left \
+      --preview='cat "$FZF_CONFIG_PREVIEW_FILE"' \
+      --preview-window='up,60%,border-bottom,nowrap' \
+      --header='回车勾选 / 取消，空格确认，Ctrl+A 全选，Ctrl+D 清空，← 返回主菜单，Esc 取消脚本' \
+      --bind='enter:toggle,ctrl-a:select-all,ctrl-d:deselect-all' \
+      --bind='space:transform:if [ "${FZF_SELECT_COUNT:-0}" -gt 0 ]; then echo accept; else echo "change-header:请先回车勾选项目；← 返回主菜单，Esc 取消脚本"; fi')" || picker_result=$?
+  if [[ "${selected%%$'\n'*}" == left ]]; then
+    return 2
+  fi
+  if (( picker_result != 0 )); then
+    [[ "$picker_result" == 130 ]] && return 130
+    error_echo "子模块选择器失败（退出码 $picker_result），未开始同步"
+    return 1
+  fi
+  [[ "$selected" == *$'\n'* ]] || return 2
+  payload="${selected#*$'\n'}"
+  [[ -n "$payload" ]] || return 2
+  selected_paths=("${(@f)payload}")
+  for p in "${selected_paths[@]}"; do
+    if (( ${CONFIG_PATHS[(Ie)$p]} == 0 )); then
+      error_echo "选择器返回了清单外的路径，未开始同步：$p"
+      return 1
     fi
-    key="$SUBMODULE_PICKER_KEY"
-
-    case "$key" in
-      $'\e[A'|k)
-        (( cursor-- ))
-        [[ $cursor -lt 1 ]] && cursor=$total
-        ;;
-      $'\e[B'|j)
-        (( cursor++ ))
-        [[ $cursor -gt $total ]] && cursor=1
-        ;;
-      $'\r'|$'\n')
-        if [[ $cursor -eq 1 ]]; then
-          if submodule_picker_all_selected; then
-            SUBMODULE_PICKED=()
-            message="已取消全选"
-          else
-            SUBMODULE_PICKED=()
-            for p in "${CONFIG_PATHS[@]}"; do
-              SUBMODULE_PICKED[$p]=1
-            done
-            message="已全选 ${#CONFIG_PATHS[@]} 个项目"
-          fi
-        else
-          p="${CONFIG_PATHS[$(( cursor - 1 ))]}"
-          if [[ -n "${SUBMODULE_PICKED[$p]:-}" ]]; then
-            unset "SUBMODULE_PICKED[$p]"
-            message="已取消：$(preview_safe_text "$p")"
-          else
-            SUBMODULE_PICKED[$p]=1
-            message="已勾选：$(preview_safe_text "$p")"
-          fi
-        fi
-        ;;
-      ' ')
-        local -a selected_paths
-        selected_paths=()
-        for p in "${CONFIG_PATHS[@]}"; do
-          if [[ -n "${SUBMODULE_PICKED[$p]:-}" ]]; then
-            selected_paths+=("$p")
-          fi
-        done
-
-        if [[ ${#selected_paths[@]} -eq 0 ]]; then
-          message="⚠️  还没有勾选任何子模块：请先用回车(Enter)勾选，再按空格键(Space)确认"
-          continue
-        fi
-
-        command clear 2>/dev/null || printf '\033[2J\033[H'
-        reconcile_gitmodules_with_config_once || return 1
-        info_echo "开始同步已选择的子模块：${selected_paths[*]}"
-        sync_selected_submodules_to_latest "${selected_paths[@]}" || return 1
-        stage_and_commit_parent_changes "${selected_paths[@]}" || return 1
-        parent_push_if_needed || return 1
-        success_echo "已选择子模块同步完成"
-        return 0
-        ;;
-      $'\e[D'|$'\eOD'|$'\e[1D'|$'\e[1;2D'|$'\e[1;3D'|$'\e[1;4D'|$'\e[1;5D'|h|H)
-        note_echo "已返回上一页"
-        return 2
-        ;;
-      $'\e')
-        note_echo "已停止脚本"
-        return 130
-        ;;
-      *)
-        message="提示：↑/↓ 移动，回车(Enter)勾选/取消，空格键(Space)确认并开始同步，← 返回上一页"
-        ;;
-    esac
   done
+
+  synchronize_parent_repository || return 1
+  reconcile_gitmodules_with_config_once || return 1
+  info_echo "开始同步已选择的子模块：${selected_paths[*]}"
+  sync_selected_submodules_to_latest "${selected_paths[@]}" || return 1
+  stage_and_commit_parent_changes "${selected_paths[@]}" || return 1
+  parent_push_if_needed || return 1
+  success_echo "已选择子模块同步完成"
+  return 0
 }
 # ============================== fzf 菜单 ==============================
 # 展示主菜单并返回用户选中的同步动作。
 select_menu_action() {
-  local preview_file="$1"
-  local selected=""
+  local preview_file="$1" menu_cursor="${2:-1}"
+  local selected="" picker_result=0
 
   selected="$(printf '%s\n' \
     "全量同步更新下载到最新" \
@@ -2226,17 +2091,23 @@ select_menu_action() {
     "添加并同步一个新的 Git 地址" \
     "切换同步深度（向下递归 / 仅直属一层）" \
     "退出" \
-    | FZF_CONFIG_PREVIEW_FILE="$preview_file" fzf \
-        --prompt='请选择操作 > ' \
-        --height=100% \
-        --border \
-        --reverse \
+    | FZF_CONFIG_PREVIEW_FILE="$preview_file" FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf \
+        --prompt='请选择操作 > ' --expect=left \
+        --height=100% --border --reverse --sync \
         --preview='cat "$FZF_CONFIG_PREVIEW_FILE"' \
         --preview-window='up,70%,border-bottom,nowrap' \
-        --header="当前深度：$(submodule_recursion_label)；可在菜单中切换。上方配置预览支持 Ctrl+K/J 滚动、Ctrl+U/D 翻页。" \
-        --bind='ctrl-k:preview-up,ctrl-j:preview-down,ctrl-u:preview-page-up,ctrl-d:preview-page-down')" || return 1
-
-  printf '%s\n' "$selected"
+        --header="当前深度：$(submodule_recursion_label)；← 返回用途选择，Esc 取消。Ctrl+K/J 滚动预览，Ctrl+U/D 翻页。" \
+        --bind="start:pos($menu_cursor)" \
+        --bind='ctrl-k:preview-up,ctrl-j:preview-down,ctrl-u:preview-page-up,ctrl-d:preview-page-down')" || picker_result=$?
+  if [[ "${selected%%$'\n'*}" == left ]]; then
+    print -r -- '__JOBS_BACK_MODE__'
+    return 0
+  fi
+  (( picker_result == 0 )) || return "$picker_result"
+  [[ "$selected" == *$'\n'* ]] || return 130
+  selected="${selected#*$'\n'}"
+  [[ -n "$selected" ]] || return 130
+  print -r -- "$selected"
 }
 # 将递归配置转为菜单和日志中的明确范围。
 submodule_recursion_label() {
@@ -2248,14 +2119,26 @@ submodule_recursion_label() {
 }
 # 单独选择深度，取消后保留当前设置并返回主菜单。
 select_submodule_recursion_interactive() {
-  local selected=""
+  local selected="" picker_result=0 depth_cursor=1
+  [[ "$SUBMODULE_RECURSIVE" == 0 ]] && depth_cursor=2
   selected="$(printf '%s\n' '向下递归（所选子树逐层最新）' '仅直属一层（不拉取下层）' |
-    fzf --prompt='同步深度 > ' --height=40% --border --reverse \
-      --header="当前：$(submodule_recursion_label)；Esc 返回。递归不向上、不扩展未选子树。")" || return 0
+    FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf \
+      --prompt='同步深度 > ' --height=40% --border --reverse --expect=left --sync \
+      --bind="start:pos($depth_cursor)" \
+      --header="当前：$(submodule_recursion_label)；← 返回主菜单，Esc 取消脚本。递归不向上、不扩展未选子树。")" || picker_result=$?
+  [[ "${selected%%$'\n'*}" == left ]] && return 0
+  if (( picker_result != 0 )); then
+    [[ "$picker_result" == 130 ]] && return 130
+    error_echo "同步深度选择器失败（退出码 $picker_result），原设置保留"
+    return 1
+  fi
+  [[ "$selected" == *$'\n'* ]] || return 0
+  selected="${selected#*$'\n'}"
   case "$selected" in
     '向下递归（所选子树逐层最新）') SUBMODULE_RECURSIVE=1 ;;
     '仅直属一层（不拉取下层）') SUBMODULE_RECURSIVE=0 ;;
-    *) return 0 ;;
+    '') return 0 ;;
+    *) error_echo "同步深度选择无效，原设置保留"; return 1 ;;
   esac
   info_echo "同步深度已选择：$(submodule_recursion_label)"
 }
@@ -2318,50 +2201,50 @@ EOF2
 }
 # 封装 main_menu_loop 对应的独立处理逻辑。
 main_menu_loop() {
-  local preview_file="$1"
-
+  local preview_file="$1" action="" picker_result=0 result=0 menu_cursor=1
   while true; do
     build_intro_content > "$preview_file"
-
-    local action=""
-    if ! action="$(select_menu_action "$preview_file")"; then
-      note_echo "已取消选择，退出"
-      return 0
+    picker_result=0
+    action="$(select_menu_action "$preview_file" "$menu_cursor")" || picker_result=$?
+    if (( picker_result != 0 )); then
+      note_echo "已停止菜单选择，未开始新的同步"
+      return "$picker_result"
     fi
-
     case "$action" in
+      "__JOBS_BACK_MODE__") return 20 ;;
       "全量同步更新下载到最新")
+        synchronize_parent_repository || return 1
         full_sync_to_latest || return 1
         return 0
         ;;
       "选择指定子模块同步（可多选）")
-        local result=0
-        select_configured_submodules_interactive "$preview_file" || result="$?"
-        if [[ "$result" == "0" ]]; then
+        menu_cursor=2
+        result=0
+        select_configured_submodules_interactive "$preview_file" || result=$?
+        if (( result == 0 )); then
           return 0
-        elif [[ "$result" == "2" ]]; then
+        elif (( result == 2 )); then
           continue
-        else
-          return "$result"
         fi
+        return "$result"
         ;;
       "只更新目前已有的")
+        synchronize_parent_repository || return 1
         update_existing_to_latest || return 1
         return 0
         ;;
       "添加并同步一个新的 Git 地址")
+        menu_cursor=4
         add_new_git_url_interactive || return 1
         ;;
       "切换同步深度（向下递归 / 仅直属一层）")
-        select_submodule_recursion_interactive || return 1
+        menu_cursor=5
+        result=0
+        select_submodule_recursion_interactive || result=$?
+        (( result == 0 )) || return "$result"
         ;;
-      "退出")
-        note_echo "已退出"
-        return 0
-        ;;
-      *)
-        warn_echo "未知选项：$action"
-        ;;
+      "退出") note_echo "已退出"; return 130 ;;
+      *) error_echo "未知菜单选项，未开始同步：$action"; return 1 ;;
     esac
   done
 }
@@ -2403,12 +2286,11 @@ prepare_parent_repository() {
   cd_to_script_dir || return 1 # 以当前入口推导的父仓根目录作为全部相对路径基准。
   load_configured_submodules || return 1 # 保留各仓独立清单与已有共享登记。
   ensure_repo_initialized || return 1 # 拒绝非仓库或位于错误层级的目录。
-  run_cmd restore_configured_markdown_toc "$REPO_ROOT" 2>&1 | tee -a "$LOG_FILE" || return 1 # 有过滤器才恢复当前目录标签。
   configure_gitee_https_transport || return 1 # 在首次联网前配置当前进程的 Gitee HTTPS 规则。
-  ensure_git_remote "$REMOTE_NAME" || return 1 # 检查所选父仓远端并显示实际线路。
 }
 # 保留既有分支选择及父仓拉取策略。
 synchronize_parent_repository() {
+  ensure_git_remote "$REMOTE_NAME" || return 1 # 业务已确认后才允许补建缺失远端。
   ensure_parent_branch || return 1 # 确认当前父仓分支后再拉取。
   parent_pull_rebase || return 1 # 父仓有未提交改动时按既有策略跳过拉取。
   run_cmd restore_configured_markdown_toc "$REPO_ROOT" 2>&1 | tee -a "$LOG_FILE" || return 1 # 无更新拉取也检查已配置的还原流程。
@@ -2444,7 +2326,6 @@ run_management_download() {
   show_script_intro_and_wait # 首先展示维护模式内置自述，确认失败立即停止。
   initialize_script_runtime # 确认后初始化 Shell、入口路径和本轮日志。
   prepare_parent_repository # 验证父仓根目录，载入本仓清单并准备下载线路。
-  synchronize_parent_repository # 按既有分支规则先处理父仓更新。
   ensure_fzf_healthy # 复用可用菜单工具，缺失时才处理依赖。
   prepare_preview_runtime # 准备菜单预览及退出清理。
   main_menu_loop "$PREVIEW_FILE" # 根据菜单选择同步，失败立即向入口传播。
@@ -2453,25 +2334,33 @@ run_management_download() {
 # 先选择用途，默认只拉取在维护依赖和父仓写操作之前分流。
 select_download_operation_mode() {
   initialize_script_paths || return 1
-  local answer=""
+  local selected="" picker_result=0 mode_cursor=1
+  [[ "${DOWNLOAD_OPERATION_MODE:-readonly}" == maintenance ]] && mode_cursor=2
   print -r -- '================ Git 子模块下载与同步 ================' | jobs_intro_style title
-  print -r -- '同步策略版本：2026.10.21-toc（分支最新；有目录过滤器才还原）' | jobs_intro_style body
+  print -r -- '同步策略版本：2026.10.25-fzf-navigation（选择支持逐层返回，子仓继续跟随分支最新）' | jobs_intro_style body
+  print -r -- '同步策略：只拉取跟随各层目标分支最新；维护模式保留本仓清单及原提交开关。' | jobs_intro_style body
   print -r -- "目标父仓：$REPO_ROOT" | jobs_intro_style body
-  print -r -- '1、只拉取（默认）：更新当前父仓明确上游，再向下同步各层目标分支最新并保持分支态；不暂存、不提交、不推送。' | jobs_intro_style body
-  print -r -- '2、维护：保留原清单、分支最新、子树选择和直属深度；登记、提交和推送沿用原开关（默认提交、不推送）。' | jobs_intro_style body
-  print -r -- '清单、深度和 AUTO_PARENT_* 配置只用于维护模式；危险舍弃仍须另行精确输入 YES，Ctrl+C 取消。' | jobs_intro_style body
+  print -r -- '只拉取不暂存、不提交、不推送；维护模式会登记子仓，沿用 AUTO_PARENT_*。危险舍弃另需 YES。' | jobs_intro_style body
+  print -r -- '先通过 fzf 选择用途，再阅读对应自述并回车确认；← 从维护菜单返回本页，Esc / Ctrl+C 取消。' | jobs_intro_style body
   if [[ ! -t 0 || ! -t 1 ]]; then
     print -u2 -r -- '当前没有可交互终端，未执行任何同步；请在终端重新运行。'
     return 1
   fi
-  while true; do
-    IFS= read -r 'answer?➤ 选择模式（回车或 1：只拉取；2：维护）：' || return 1
-    case "$answer" in
-      ''|1) DOWNLOAD_OPERATION_MODE=readonly; return 0 ;;
-      2) DOWNLOAD_OPERATION_MODE=maintenance; return 0 ;;
-      *) print -r -- '请输入 1、2，或直接回车。' ;;
-    esac
-  done
+  if ! command -v fzf >/dev/null 2>&1 || ! fzf --version >/dev/null 2>&1; then
+    print -u2 -r -- 'fzf 未安装或不可用，未执行同步。请先安装 / 修复 fzf（已有 Homebrew 时可运行 brew install fzf），再重新运行。'
+    return 1
+  fi
+  selected="$(printf '%s\n' '只拉取（默认，不暂存、不提交、不推送）' '维护子模块（使用本仓清单及原提交开关）' |
+    FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf --height=40% --border --reverse --sync \
+      --bind="start:pos($mode_cursor)" \
+      --prompt='选择用途 > ' --header='↑↓ 移动，回车确认，Esc / Ctrl+C 取消；选中用途后仍须阅读自述并确认')" || picker_result=$?
+  (( picker_result == 0 )) || return "$picker_result"
+  case "$selected" in
+    '只拉取（默认，不暂存、不提交、不推送）') DOWNLOAD_OPERATION_MODE=readonly ;;
+    '维护子模块（使用本仓清单及原提交开关）') DOWNLOAD_OPERATION_MODE=maintenance ;;
+    '') return 130 ;;
+    *) print -u2 -r -- '用途选择无效，未执行同步。'; return 1 ;;
+  esac
 }
 # 执行内嵌的安全只拉取实现，保留终端输入且不依赖外置脚本。
 run_embedded_readonly_pull() {
@@ -3462,9 +3351,29 @@ run_selected_download_mode() {
   esac
 }
 # 先选择只拉取或维护，再执行各自独立的确认与业务流程。
+run_download_selection_loop() {
+  setopt LOCAL_OPTIONS
+  unsetopt ERR_EXIT
+  local pull_result=0
+  while true; do
+    select_download_operation_mode || return $?
+    pull_result=0
+    # 独立执行以保留业务失败即停，返回 20 仅表示回到用途选择。
+    ( set -e; run_selected_download_mode "$@" )
+    pull_result=$?
+    if (( pull_result == 20 )); then
+      continue
+    fi
+    (( pull_result == 0 )) || return "$pull_result"
+    if (( $+functions[offer_global_markdown_toc_setup] )); then
+      offer_global_markdown_toc_setup
+    fi
+    return 0
+  done
+}
+# 编排用途选择与可返回的下载流程。
 main() {
-  select_download_operation_mode # 先显示双模式用途并选择，回车默认只拉取。
-  run_selected_download_mode "$@" # 只拉取走内嵌安全引擎，维护保留原菜单和清单。
+  run_download_selection_loop "$@" # 逐层选择并执行业务，返回时重新进入用途页。
 }
 
 main "$@"
