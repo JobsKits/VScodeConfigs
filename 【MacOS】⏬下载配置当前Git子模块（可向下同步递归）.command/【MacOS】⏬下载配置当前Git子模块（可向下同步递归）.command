@@ -2,10 +2,11 @@
 # 脚本自述：
 # - 脚本名称：【MacOS】⏬下载配置当前Git子模块（可向下同步递归）.command
 # - 来源日志：克隆 / 拉取前突出平台与完整地址，完成时带来源，保留递归来源核对。
-# - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS，递归子模块继承，不写全局配置。
+# - 下载协议：Gitee 标准 SSH 地址在本次进程改走 HTTPS；首次下载持久缓存，网络限时重试，不写全局配置。
+# - 完成标记：先查远端最新提交，单仓标记与本地状态匹配才跳过；后代仍独立检查。
 # - 核心用途：回车默认只拉取明确上游并递归同步子仓分支最新；维护模式保留各仓清单、分支最新和登记流程。
 # - 影响范围：只拉取不暂存、不提交、不推送；维护模式沿用父仓登记、索引和提交开关。
-# - 文档目录：已配置目录过滤器才执行本仓 restore / verify，无配置跳过，不自动安装。
+# - 文档目录：已配置过滤器才执行本仓 restore / verify；无配置跳过，不自动安装。
 # - 运行提示：先选择只拉取或维护，再阅读对应自述并回车确认；危险舍弃另需精确 YES，Ctrl+C 取消。
 
 # 仅渲染自述：标题红色加粗，编号正文蓝色常规字重；非彩色终端输出纯文本。
@@ -249,6 +250,8 @@ SCRIPT_BASENAME="【MacOS】⏬下载配置当前Git子模块（可向下同步�
 LOG_FILE="${TMPDIR:-/tmp}/${SCRIPT_BASENAME}.log"
 PREVIEW_FILE=""
 DOWNLOAD_OPERATION_MODE=""
+DOWNLOAD_LOCK_DIRECTORY=""
+DOWNLOAD_LOCK_OWNER_SUBSHELL=-1
 
 # ============================== 全局缓存 ==============================
 # entry 格式：local_path|page_url|https_clone_url|ssh_clone_url|repo_name
@@ -260,6 +263,10 @@ CONFIG_PATHS=()
 CONFIG_REPO_NAMES=()
 GITMODULES_RECONCILED=0
 # ============================== 输出工具 ==============================
+# 维护模式的 Git 命令统一进入传输封装；本地读取与推送原样执行。
+git() {
+  jobs_download_git "$@"
+}
 # 同步显示终端输出并记录本轮日志。
 log()          { printf '%s\n' "$1" | tee -a "$LOG_FILE"; }
 # 按当前输出级别记录终端信息，并同步写入脚本日志。
@@ -385,10 +392,405 @@ restore_configured_markdown_toc() {
   "$toc_node" "$toc_tool" restore || return 1
   "$toc_node" "$toc_tool" verify
 }
+# >>> Jobs download transport >>>
+# 校验传输参数，拒绝算术表达式、空值和无边界的超时 / 重试。
+jobs_download_validate_settings() {
+  emulate -L zsh
+  local setting_name="" setting_value="" maximum=0 minimum=1
+  local -a setting_names setting_defaults setting_maxima
+  setting_names=(JOBS_DOWNLOAD_TIMEOUT JOBS_DOWNLOAD_ATTEMPTS JOBS_DOWNLOAD_RETRY_DELAY JOBS_DOWNLOAD_LOW_SPEED_LIMIT JOBS_DOWNLOAD_LOW_SPEED_TIME)
+  setting_defaults=(900 3 2 1024 60)
+  setting_maxima=(86400 10 60 1000000000 3600)
+  local -i setting_index=0
+  for (( setting_index=1; setting_index<=${#setting_names}; setting_index++ )); do
+    setting_name="${setting_names[$setting_index]}"
+    setting_value="${(P)setting_name-${setting_defaults[$setting_index]}}"
+    maximum="${setting_maxima[$setting_index]}"
+    minimum=1
+    [[ "$setting_name" == JOBS_DOWNLOAD_RETRY_DELAY ]] && minimum=0
+    if [[ "$setting_value" != <-> || ${#setting_value} -gt 10 ]] ||
+       (( 10#$setting_value < minimum || 10#$setting_value > maximum )); then
+      print -u2 -r -- "❌ ${setting_name} 必须是 ${minimum}～${maximum} 的十进制整数。"
+      return 2
+    fi
+  done
+}
+# 仅网络读取启用超时和有限重试；其它 Git 操作保持原有执行方式。
+jobs_download_git() {
+  emulate -L zsh
+  setopt LOCAL_TRAPS
+  local -a git_arguments
+  git_arguments=("$@")
+  local git_operation="" git_argument="" error_file="" jobs_download_input_fd=""
+  local -i argument_index=1 attempt=1 result=0 watchdog_pid=0 attempt_limit=1 retry_delay=0 cancelled=0 jobs_download_input_fd=0
+  while (( argument_index <= ${#git_arguments} )); do
+    git_argument="${git_arguments[$argument_index]}"
+    case "$git_argument" in
+      -C|-c|--git-dir|--work-tree|--namespace|--config-env|--super-prefix)
+        (( argument_index += 2 )) ;;
+      --git-dir=*|--work-tree=*|--namespace=*|--config-env=*|--super-prefix=*|-C?*|-c?*)
+        (( argument_index += 1 )) ;;
+      --)
+        (( argument_index += 1 ))
+        git_operation="${git_arguments[$argument_index]:-}"
+        break ;;
+      -*) (( argument_index += 1 )) ;;
+      *) git_operation="$git_argument"; break ;;
+    esac
+  done
+  case "$git_operation" in
+    ls-remote)
+      if (( ${git_arguments[(Ie)--get-url]} > argument_index )); then
+        command git "${git_arguments[@]}"
+        return $?
+      fi ;;
+    fetch|clone|pull) ;;
+    *) command git "${git_arguments[@]}"; return $? ;;
+  esac
+  jobs_download_validate_settings || return $?
+  local -i timeout_seconds=$(( 10#${JOBS_DOWNLOAD_TIMEOUT-900} ))
+  local -i low_speed_limit=$(( 10#${JOBS_DOWNLOAD_LOW_SPEED_LIMIT-1024} ))
+  local -i low_speed_time=$(( 10#${JOBS_DOWNLOAD_LOW_SPEED_TIME-60} ))
+  if [[ "$git_operation" != pull ]]; then
+    attempt_limit=$(( 10#${JOBS_DOWNLOAD_ATTEMPTS-3} ))
+  fi
+  retry_delay=$(( 10#${JOBS_DOWNLOAD_RETRY_DELAY-2} ))
+  error_file="$(
+    umask 077
+    /usr/bin/mktemp "${TMPDIR:-/tmp}/jobs-git-transfer.XXXXXXXX"
+  )" || return 1
+  trap 'cancelled=130; if (( watchdog_pid > 0 )); then kill -TERM "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null; fi' INT
+  trap 'cancelled=143; if (( watchdog_pid > 0 )); then kill -TERM "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null; fi' TERM
+  trap 'cancelled=129; if (( watchdog_pid > 0 )); then kill -HUP "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null; fi' HUP
+  trap '' TTOU
+  exec {jobs_download_input_fd}<&0 || return 1
+  {
+  while (( attempt <= attempt_limit )); do
+    : > "$error_file"
+    /usr/bin/perl -e '
+use strict;
+use warnings;
+use POSIX qw(setpgid tcgetpgrp tcsetpgrp WNOHANG);
+use IO::Select;
+use File::Temp ();
+use Time::HiRes qw(time sleep);
+my ($timeout, $error_file, $operation, @command) = @ARGV;
+my $query_output = $operation eq "ls-remote" ? File::Temp->new(
+  TEMPLATE => "jobs-git-query.XXXXXXXX", DIR => ($ENV{TMPDIR} || "/tmp"), UNLINK => 1
+) : undef;
+open my $record, ">", $error_file or die "无法打开私有传输诊断文件。\n";
+binmode $record;
+pipe my $reader, my $writer or die "无法建立 Git 诊断管道。\n";
+pipe my $ready_reader, my $ready_writer or die "无法建立 Git 终端交接管道。\n";
+my $cancel_code = 0;
+$SIG{INT} = sub { $cancel_code ||= 130 };
+$SIG{TERM} = sub { $cancel_code ||= 143 };
+$SIG{HUP} = sub { $cancel_code ||= 129 };
+my ($terminal, $terminal_group, $terminal_owned, $child) = (undef, 0, 0, 0);
+if (open $terminal, "+<", "/dev/tty") {
+  my $foreground = tcgetpgrp(fileno($terminal));
+  my $caller_group = getpgrp(getppid());
+  $terminal_group = $caller_group if defined $foreground && $foreground == $caller_group;
+}
+$SIG{TTOU} = "IGNORE";
+my $restore_terminal = sub {
+  return unless $terminal_owned && $terminal;
+  my $foreground = tcgetpgrp(fileno($terminal));
+  if (defined $foreground && $foreground == $child) {
+    tcsetpgrp(fileno($terminal), $terminal_group) == 0 or warn "无法恢复本次 Git 传输前的终端进程组。\n";
+  }
+  $terminal_owned = 0;
+};
+END { $restore_terminal->() if $restore_terminal; }
+$child = fork();
+defined $child or die "无法启动 Git 传输。\n";
+if ($child == 0) {
+  $SIG{INT} = $SIG{TERM} = $SIG{HUP} = "DEFAULT";
+  $SIG{TTOU} = "DEFAULT";
+  close $reader;
+  close $record;
+  close $ready_writer;
+  setpgid(0, 0) == 0 or POSIX::_exit(125);
+  open STDERR, ">&", $writer or POSIX::_exit(125);
+  if ($query_output) {
+    open STDOUT, ">&", $query_output or POSIX::_exit(125);
+    close $query_output;
+  }
+  close $writer;
+  sysread($ready_reader, my $ready, 1) == 1 or POSIX::_exit(125);
+  close $ready_reader;
+  exec { $command[0] } @command or do {
+    print STDERR "无法执行 Git。\n";
+    POSIX::_exit(127);
+  };
+}
+close $writer;
+close $ready_reader;
+setpgid($child, $child);
+if ($terminal_group && tcgetpgrp(fileno($terminal)) == $terminal_group) {
+  if (tcsetpgrp(fileno($terminal), $child) == 0) {
+    $terminal_owned = 1;
+  } else {
+    warn "无法向 Git 交接终端，已停止本次传输。\n";
+    close $ready_writer;
+    kill "TERM", -$child;
+    waitpid($child, 0);
+    exit 125;
+  }
+}
+syswrite($ready_writer, "1") == 1 or die "无法完成 Git 终端交接。\n";
+close $ready_writer;
+my $selector = IO::Select->new($reader);
+my $deadline = time() + $timeout;
+my ($stop_code, $stop_time, $child_status, $reaped) = (0, 0, 0, 0);
+my $display_pending = "";
+my $display_safe = sub {
+  my ($display) = @_;
+  $display =~ s/\e\[[0-?]*[ -\/]*[\@-~]//g;
+  $display =~ s{([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*\@}{$1***\@}g;
+  $display =~ s{((?:https?|ssh|git|file)://[^\s?#]+)[?#][^\s]*}{$1?[REDACTED]}g;
+  print STDERR $display;
+};
+my $drain = sub {
+  for my $handle ($selector->can_read(0.05)) {
+    my $read = sysread($handle, my $buffer, 65536);
+    if (defined $read && $read > 0) {
+      print {$record} $buffer;
+      $display_pending .= $buffer;
+      while ($display_pending =~ s/^(.*?[\r\n])//s) { $display_safe->($1); }
+      if ($display_pending =~ /(?:\A|[\r\n])(?:(?:Username|Password|Verification code):\s*|(?:Username|Password) for [\x27\x22][^\r\n]*[\x27\x22]:\s*|Enter passphrase for key [\x27\x22][^\r\n]*[\x27\x22]:\s*|Are you sure you want to continue connecting[^\r\n]*\?\s*)\z/i) {
+        $display_safe->($display_pending);
+        $display_pending = "";
+      }
+    } elsif (defined $read && $read == 0) {
+      $selector->remove($handle);
+      close $handle;
+    }
+  }
+};
+while (1) {
+  if (!$stop_code && ($cancel_code || time() >= $deadline)) {
+    $stop_code = $cancel_code || 124;
+    $stop_time = time();
+    if ($stop_code == 124) {
+      my $message = "⚠ Git 传输单次超时（${timeout} 秒），正在终止本次进程组。\n";
+      print STDERR $message;
+      print {$record} $message;
+    }
+    kill "TERM", -$child;
+  }
+  if (!$reaped) {
+    my $waited = waitpid($child, WNOHANG);
+    if ($waited == $child) {
+      $child_status = $?;
+      $reaped = 1;
+      my $completion = ($child_status & 127) ? 128 + ($child_status & 127) : $child_status >> 8;
+      if (!$stop_code && ($completion == 129 || $completion == 130 || $completion == 143)) {
+        $stop_code = $completion;
+        $stop_time = time();
+        kill "TERM", -$child;
+      }
+    }
+  }
+  $drain->();
+  if ($stop_code) {
+    if (time() >= $stop_time + 2) {
+      kill "KILL", -$child;
+      if (!$reaped) { waitpid($child, 0); $child_status = $?; $reaped = 1; }
+      $drain->();
+      last;
+    }
+  } elsif ($reaped && !$selector->count) {
+    last;
+  }
+}
+$display_safe->($display_pending) if length $display_pending;
+close $record;
+$restore_terminal->();
+exit $stop_code if $stop_code;
+my $result = ($child_status & 127) ? 128 + ($child_status & 127) : $child_status >> 8;
+if ($query_output && $result == 0) {
+  seek($query_output, 0, 0) or die "无法读取 Git 查询结果。\n";
+  while (1) {
+    my $read = read($query_output, my $buffer, 65536);
+    defined $read or die "无法读取 Git 查询结果。\n";
+    last if $read == 0;
+    print STDOUT $buffer;
+  }
+}
+exit $result;
+' "$timeout_seconds" "$error_file" "$git_operation" git \
+      -c "http.lowSpeedLimit=${low_speed_limit}" \
+      -c "http.lowSpeedTime=${low_speed_time}" \
+      "${git_arguments[@]}" <&$jobs_download_input_fd &
+    watchdog_pid=$!
+    result=0
+    wait "$watchdog_pid" || result=$?
+    watchdog_pid=0
+    (( cancelled > 0 )) && return "$cancelled"
+    (( result == 0 )) && return 0
+    (( result == 129 || result == 130 || result == 143 )) && return "$result"
+    (( attempt >= attempt_limit )) && return "$result"
+    if LC_ALL=C /usr/bin/grep -Eiq 'authentication failed|permission denied|could not read (Username|Password)|terminal prompts disabled|host key verification failed|repository .*not found|does not appear to be a git repository|couldn.t find remote ref|remote branch .*not found|not our ref|requested URL returned error: (400|401|403|404|422)|SSL certificate problem' "$error_file"; then
+      return "$result"
+    fi
+    if (( result != 124 )) && ! LC_ALL=C /usr/bin/grep -Eiq 'could not resolve (host|proxy)|failed to connect|connection (reset|refused|timed out|closed|aborted)|operation timed out|operation too slow|timeout was reached|curl (18|28|35|52|55|56|92)|network is unreachable|early EOF|unexpected disconnect|remote end hung up|SSL_ERROR_SYSCALL|TLS connection was non-properly terminated|HTTP/2 stream .*not closed cleanly|requested URL returned error: (408|429|5[0-9][0-9])|RPC failed' "$error_file"; then
+      return "$result"
+    fi
+    print -u2 -r -- "⚠ Git ${git_operation} 网络失败（退出码 ${result}）；${retry_delay} 秒后重试 $(( attempt + 1 ))/${attempt_limit}。"
+    if (( retry_delay > 0 )); then
+      /bin/sleep "$retry_delay" &
+      watchdog_pid=$!
+      wait "$watchdog_pid" || result=$?
+      watchdog_pid=0
+    fi
+    (( cancelled > 0 )) && return "$cancelled"
+    (( attempt += 1 ))
+    (( retry_delay *= 2 ))
+    (( retry_delay > 60 )) && retry_delay=60
+  done
+  return "$result"
+  } always {
+    exec {jobs_download_input_fd}<&-
+    /bin/rm -f -- "$error_file"
+  }
+}
+# <<< Jobs download transport <<<
+# 一次远端查询同时解析目标分支与提交；不缓存跨运行结果，不放宽来源和分支约束。
+jobs_download_remote_branch() {
+  emulate -L zsh
+  [[ "$#" -eq 3 ]] || return 2
+  local repository="$1" source_url="$2" requested_branch="$3"
+  local branch="$requested_branch" listing="" target=""
+  if [[ -n "$requested_branch" ]]; then
+    [[ "$requested_branch" != -* && "$requested_branch" != HEAD && "$requested_branch" != *$'\n'* && "$requested_branch" != *$'\r'* ]] || return 1
+    command git -C "$repository" -c core.hooksPath=/dev/null check-ref-format "refs/heads/${requested_branch}" >/dev/null || return 1
+    listing="$(jobs_download_git -C "$repository" -c core.hooksPath=/dev/null ls-remote --exit-code --heads -- "$source_url" "refs/heads/${requested_branch}")" || return $?
+    target="$(print -r -- "$listing" | /usr/bin/awk -v wanted="refs/heads/${requested_branch}" 'NF == 2 && $2 == wanted { print $1 }')" || return 1
+  else
+    listing="$(jobs_download_git -C "$repository" -c core.hooksPath=/dev/null ls-remote --exit-code --symref -- "$source_url" HEAD)" || return $?
+    branch="$(print -r -- "$listing" | /usr/bin/awk 'NF == 3 && $1 == "ref:" && $2 ~ /^refs\/heads\// && $3 == "HEAD" { print substr($2, 12) }')" || return 1
+    target="$(print -r -- "$listing" | /usr/bin/awk 'NF == 2 && $2 == "HEAD" { print $1 }')" || return 1
+    [[ -n "$branch" && "$branch" != -* && "$branch" != HEAD && "$branch" != *$'\n'* && "$branch" != *$'\r'* ]] || return 1
+    command git -C "$repository" -c core.hooksPath=/dev/null check-ref-format "refs/heads/${branch}" >/dev/null || return 1
+  fi
+  [[ "$target" != *$'\n'* && ( ${#target} == 40 || ${#target} == 64 ) && "$target" != *[^0-9a-f]* ]] || return 1
+  printf '%s\t%s\n' "$branch" "$target"
+}
+# 复用同一次严格分支查询；旧调用方仍只接收提交号。
+jobs_download_remote_tip() {
+  local result=""
+  result="$(jobs_download_remote_branch "$@")" || return $?
+  print -r -- "${result#*$'\t'}"
+}
+# 标记绑定真实来源、分支、提交及上游配置；来源只存摘要，避免写入 URL 凭据。
+jobs_download_marker_signature() {
+  local repository="$1" source_url="$2" branch="$3" target="$4"
+  local effective_url="" upstream="" branch_remote="" remote_url=""
+  effective_url="$(command git -C "$repository" ls-remote --get-url -- "$source_url")" || return 1
+  upstream="$(command git -C "$repository" rev-parse --symbolic-full-name "${branch}@{upstream}")" || return 1
+  branch_remote="$(command git -C "$repository" config --get "branch.${branch}.remote")" || return 1
+  remote_url="$(command git -C "$repository" config --get-all "remote.${branch_remote}.url")" || return 1
+  printf '%s\0' v1 "$source_url" "$effective_url" "$branch" "$target" "$upstream" "$branch_remote" "$remote_url" | command git -C "$repository" hash-object --stdin
+}
+# HEAD、分支和源码必须仍与完成状态一致；子模块指针漂移由后代单独检查。
+jobs_download_marker_matches() {
+  local repository="$1" source_url="$2" branch="$3" target="$4" marker="" signature="" state=""
+  marker="$(command git -C "$repository" rev-parse --absolute-git-dir)" || return 1
+  marker+='/jobs-download-complete'
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  [[ "$(command git -C "$repository" symbolic-ref --quiet --short HEAD)" == "$branch" && "$(command git -C "$repository" rev-parse HEAD)" == "$target" ]] || return 1
+  state="$(command git -C "$repository" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" || return 1
+  [[ -z "$state" ]] || return 1
+  signature="$(jobs_download_marker_signature "$repository" "$source_url" "$branch" "$target")" || return 1
+  [[ "$(<"$marker")" == "v1 ${target} ${signature}" ]]
+}
+# 成功核验后原子写入完成标记；失败不会把旧状态误记成新目标。
+jobs_download_write_marker() {
+  local repository="$1" source_url="$2" branch="$3" target="$4" marker="" stage="" signature="" state=""
+  [[ "$(command git -C "$repository" symbolic-ref --quiet --short HEAD)" == "$branch" && "$(command git -C "$repository" rev-parse HEAD)" == "$target" ]] || return 1
+  state="$(command git -C "$repository" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" || return 1
+  [[ -z "$state" ]] || return 1
+  signature="$(jobs_download_marker_signature "$repository" "$source_url" "$branch" "$target")" || return 1
+  marker="$(command git -C "$repository" rev-parse --absolute-git-dir)" || return 1
+  marker+='/jobs-download-complete'
+  [[ ! -L "$marker" && ( ! -e "$marker" || -f "$marker" ) ]] || return 1
+  stage="$(/usr/bin/mktemp "${marker}.XXXXXXXX")" || return 1
+  if ! print -r -- "v1 ${target} ${signature}" > "$stage" || ! /bin/mv -f -- "$stage" "$marker"; then
+    /bin/rm -f -- "$stage"
+    return 1
+  fi
+}
+# 路径、配置来源和实际展开来源共同定位缓存；不使用会随清单变化的计划序号。
+jobs_download_cache_repository() {
+  local entry_root="$1" child_root="${2:A}" source_url="$3"
+  local git_directory="" effective_url="" cache_key="" cache_root="" cache_repo="" bare_state=""
+  git_directory="$(command git -C "$entry_root" rev-parse --absolute-git-dir)" || return 1
+  effective_url="$(GIT_DIR=/dev/null command git -C "$entry_root" ls-remote --get-url -- "$source_url")" || return 1
+  cache_key="$(printf '%s\0%s\0%s\0' "$child_root" "$source_url" "$effective_url" | command git -C "$entry_root" hash-object --stdin)" || return 1
+  cache_root="${git_directory}/jobs-download-cache/v1"
+  cache_repo="${cache_root}/${cache_key}.git"
+  [[ ! -L "${git_directory}/jobs-download-cache" && ! -L "$cache_root" && ! -L "$cache_repo" ]] || {
+    print -u2 -r -- "下载缓存经过符号链接，保留并停止：$cache_root"
+    return 1
+  }
+  if [[ ! -e "$cache_repo" || ( -d "$cache_repo" && -z "$(/usr/bin/find "$cache_repo" -mindepth 1 -maxdepth 1 -print -quit)" ) ]]; then
+    mkdir -p -- "$cache_root" || return 1
+    command git -c core.hooksPath=/dev/null init --bare --quiet "$cache_repo" || return 1
+  fi
+  # 仅接受本工具创建的裸缓存；.git/modules 的用户索引和提交不在此处处理。
+  bare_state="$(command git -C "$cache_repo" rev-parse --is-bare-repository)" || return 1
+  [[ "$bare_state" == true && ! -e "${cache_repo}/index" ]] || {
+    print -u2 -r -- "下载缓存不是独立裸对象库，保留并停止：$cache_repo"
+    return 1
+  }
+  print -r -- "$cache_repo"
+}
+# 在本仓Git元数据内完成首次检出，再移入空目标；失败只清本次暂存目录，保留下载缓存。
+jobs_download_checkout_from_cache() (
+  emulate -L zsh
+  setopt NO_NOMATCH PIPE_FAIL
+  local parent_root="$1" cache_repo="$2" child_root="${3:A}" source_url="$4"
+  local branch="$5" remote_name="$6" expected_head="$7"
+  local git_directory="" stage_parent="" stage="" target_contents="" stage_state=""
+  git_directory="$(command git -C "$parent_root" rev-parse --absolute-git-dir)" || return 1
+  stage_parent="${git_directory}/jobs-download-cache/worktrees"
+  [[ ! -L "${git_directory}/jobs-download-cache" && ! -L "$stage_parent" ]] || return 1
+  umask 077
+  mkdir -p -- "$stage_parent" || return 1
+  stage="$(/usr/bin/mktemp -d "${stage_parent}/checkout.XXXXXXXX")" || return 1
+  trap 'if [[ -n "$stage" && "$stage" == "${stage_parent}/checkout."* && -d "$stage" && ! -L "$stage" ]]; then /usr/bin/find "$stage" -depth -delete; fi' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  jobs_download_git -C "$parent_root" -c core.hooksPath=/dev/null -c submodule.recurse=false clone --no-checkout --no-local --no-tags --single-branch --branch "$branch" --origin "$remote_name" --no-recurse-submodules -- "$cache_repo" "$stage/worktree" || return $?
+  command git -C "$stage/worktree" -c core.hooksPath=/dev/null remote set-url "$remote_name" "$source_url" || return 1
+  [[ "$(command git -C "$stage/worktree" rev-parse HEAD)" == "$expected_head" ]] || return 1
+  jobs_download_git -C "$stage/worktree" -c core.hooksPath=/dev/null -c submodule.recurse=false checkout --no-recurse-submodules --no-overwrite-ignore "$branch" || return $?
+  [[ "$(command git -C "$stage/worktree" rev-parse HEAD)" == "$expected_head" && "$(command git -C "$stage/worktree" symbolic-ref --quiet --short HEAD)" == "$branch" ]] || return 1
+  stage_state="$(command git -C "$stage/worktree" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" || return 1
+  [[ -z "$stage_state" && ! -L "$child_root" ]] || return 1
+  if [[ -e "$child_root" ]]; then
+    [[ -d "$child_root" ]] || return 1
+    target_contents="$(/usr/bin/find "$child_root" -mindepth 1 -maxdepth 1 -print -quit)" || return 1
+    [[ -z "$target_contents" ]] || { print -u2 -r -- "首次检出目标出现新内容，保留并停止：$child_root"; return 1; }
+    /bin/rmdir -- "$child_root" || return 1
+  fi
+  mkdir -p -- "${child_root:h}" || return 1
+  /usr/bin/perl -e 'rename($ARGV[0], $ARGV[1]) or die "首次检出目录原子移入失败，已保留目标原内容。\n"' "$stage/worktree" "$child_root" || return 1
+  [[ ! -e "$stage/worktree" && -e "$child_root/.git" ]] || return 1
+)
+# 终端和日志共用脱敏流，地址凭据、查询参数和ANSI不进入落盘文本。
+jobs_download_sanitize_stream() {
+  /usr/bin/perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g; s{([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*@}{$1***@}g; s{((?:https?|ssh|git|file)://[^\s?#]+)[?#][^\s]*}{$1?[REDACTED]}g'
+}
 # 执行已经拆分完成的独立业务步骤。
 run_cmd() {
+  setopt LOCAL_OPTIONS PIPE_FAIL
   if [[ "$DRY_RUN" == "1" ]]; then
     note_echo "[DRY-RUN] $*"
+  elif [[ "$1" == git ]]; then
+    "$@" 2>&1 | jobs_download_sanitize_stream | tee -a "$LOG_FILE"
   else
     "$@"
   fi
@@ -407,18 +809,6 @@ preview_safe_text() {
   else
     printf '%s\n' "$s"
   fi
-}
-# 解析并返回后续流程需要的目标信息。
-get_ncpu() {
-  if command -v sysctl >/dev/null 2>&1; then
-    sysctl -n hw.ncpu 2>/dev/null || echo 1
-  else
-    echo 1
-  fi
-}
-# 解析并返回后续流程需要的目标信息。
-get_cpu_arch() {
-  uname -m
 }
 # 封装 cd_to_script_dir 对应的独立处理逻辑。
 cd_to_script_dir() {
@@ -776,90 +1166,16 @@ append_runtime_submodule() {
 find_brew_bin() {
   jobs_brew_find
 }
-# 封装 inject_shellenv_block 对应的独立处理逻辑。
-inject_shellenv_block() {
-  local profile_file="$1"
-  local shellenv="$2"
-  local id="homebrew_env"
-  local header="# >>> ${id} 环境变量 >>>"
-  local footer="# <<< ${id} 环境变量 <<<"
-
-  if [[ -z "$profile_file" || -z "$shellenv" ]]; then
-    error_echo "缺少参数：inject_shellenv_block <profile_file> <shellenv>"
-    return 1
-  fi
-
-  run_cmd mkdir -p "$(dirname "$profile_file")"
-  [[ -f "$profile_file" ]] || run_cmd touch "$profile_file"
-
-  if [[ "$DRY_RUN" == "1" ]]; then
-    note_echo "[DRY-RUN] 写入 $profile_file：$shellenv"
-  elif grep -Fq "$shellenv" "$profile_file"; then
-    info_echo "Homebrew shellenv 已存在：$profile_file"
-  else
-    {
-      echo ""
-      echo "$header"
-      echo "$shellenv"
-      echo "$footer"
-    } >> "$profile_file"
-    success_echo "已写入 Homebrew shellenv：$profile_file"
-  fi
-
-  if [[ "$DRY_RUN" == "0" ]]; then
-    eval "$shellenv"
-  fi
-}
-# 执行对应的环境配置或同步处理。
-install_homebrew() {
-  jobs_brew_install_or_exit # 只在真正安装时选择路径；演练模式不安装。
-}
-# 检查当前运行条件是否满足后续流程要求。
+# 只修复当前流程缺失的Homebrew；健康安装复用，持久shellenv只由新安装流程登记。
 ensure_homebrew_healthy() {
-  local jobs_existing_brew=""
-  if jobs_existing_brew="$(jobs_brew_find)"; then
-    JOBS_HOMEBREW_BIN="$jobs_existing_brew"
-    jobs_brew_activate || exit 1
-  fi
   local brew_bin=""
-
-  if ! brew_bin="$(find_brew_bin)"; then
-    install_homebrew
-    brew_bin="$(find_brew_bin)" || {
-      error_echo "Homebrew 安装后仍不可用"
-      exit 1
-    }
-  fi
-
-  if [[ "$brew_bin" == "/opt/homebrew/bin/brew" ]]; then
-    inject_shellenv_block "$HOME/.zprofile" 'eval "$(/opt/homebrew/bin/brew shellenv)"'
-  elif [[ "$brew_bin" == "/usr/local/bin/brew" ]]; then
-    inject_shellenv_block "$HOME/.zprofile" 'eval "$(/usr/local/bin/brew shellenv)"'
-  fi
-
-  if ! "$brew_bin" --version >/dev/null 2>&1; then
-    error_echo "Homebrew 已存在但不能正常响应：$brew_bin"
-    exit 1
-  fi
-
-  success_echo "Homebrew 自检通过：$($brew_bin --version | head -n 1)"
-
-  info_echo "是否更新 Homebrew？"
-  echo "👉 按 [Enter]：执行 brew update && brew upgrade && brew cleanup && brew doctor && brew -v"
-  echo "👉 输入任意字符后回车：跳过更新"
-
-  local confirm=""
-  IFS= read -r confirm
-  if [[ -z "$confirm" ]]; then
-    run_cmd "$brew_bin" update
-    run_cmd "$brew_bin" upgrade
-    run_cmd "$brew_bin" cleanup
-    "$brew_bin" doctor || warn_echo "brew doctor 有警告/错误，请按提示处理"
-    "$brew_bin" -v || warn_echo "打印 brew 版本失败，可忽略"
-    success_echo "Homebrew 更新流程完成"
+  if brew_bin="$(jobs_brew_find)"; then
+    JOBS_HOMEBREW_BIN="$brew_bin"
+    jobs_brew_activate || return 1
   else
-    note_echo "已跳过 Homebrew 更新"
+    jobs_brew_install_or_exit || return 1
   fi
+  success_echo "Homebrew 自检通过：$JOBS_HOMEBREW_BIN"
 }
 # 检查当前运行条件是否满足后续流程要求。
 ensure_fzf_healthy() {
@@ -869,7 +1185,7 @@ ensure_fzf_healthy() {
   fi
 
   warn_echo "fzf 未安装或不能正常响应，准备通过 Homebrew 安装/修复"
-  ensure_homebrew_healthy
+  ensure_homebrew_healthy || return 1
 
   local brew_bin=""
   brew_bin="$(find_brew_bin)" || {
@@ -878,9 +1194,9 @@ ensure_fzf_healthy() {
   }
 
   if "$brew_bin" list fzf >/dev/null 2>&1; then
-    run_cmd "$brew_bin" reinstall fzf
+    run_cmd "$brew_bin" reinstall fzf || return 1
   else
-    run_cmd "$brew_bin" install fzf
+    run_cmd "$brew_bin" install fzf || return 1
   fi
 
   if command -v fzf >/dev/null 2>&1 && fzf --version >/dev/null 2>&1; then
@@ -1033,54 +1349,35 @@ sync_submodule_urls_at_repo() {
     sync_submodule_urls_at_repo "$child_root" "$url" "$show_sources" || return 1
   done < <(git config -f "$repo_root/.gitmodules" --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null || true)
 }
-# 从显式选择的父 remote 开始，各层只使用自身解析后的地址。
-sync_submodule_urls_for_remote() {
-  local parent_url="" repo_root=""
-  parent_url="$(git remote get-url "$REMOTE_NAME" 2>/dev/null)" || return 1
-  repo_root="$(git rev-parse --show-toplevel)" || return 1
-  sync_submodule_urls_at_repo "$repo_root" "$parent_url"
-}
 # 封装 parent_has_uncommitted_changes 对应的独立处理逻辑。
 parent_has_uncommitted_changes() {
   [[ -n "$(git -c core.quotepath=false status --porcelain)" ]]
 }
-# 检查当前运行条件是否满足后续流程要求。
+# 目标分支存在才切换；缺本地分支时先精确获取远端，不从当前HEAD猜造分支。
 ensure_parent_branch() {
-  local b="$SUBMODULE_BRANCH"
-  local current=""
-  current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-
-  if [[ "$current" == "$b" ]]; then
-    info_echo "父仓已在分支：$b"
-    return 0
-  fi
-
-  if git rev-parse --verify "$b" >/dev/null 2>&1; then
-    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules --no-overwrite-ignore "$b"
-    return 0
-  fi
-
-  if git ls-remote --exit-code --heads "$REMOTE_NAME" "$b" >/dev/null 2>&1; then
-    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules --no-overwrite-ignore -B "$b" --track "$REMOTE_NAME/$b"
+  local branch="$SUBMODULE_BRANCH" current=""
+  command git check-ref-format "refs/heads/$branch" >/dev/null || return 1
+  current="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || current=""
+  [[ "$current" == "$branch" ]] && return 0
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    run_cmd git -c submodule.recurse=false checkout --no-recurse-submodules --no-overwrite-ignore "$branch"
   else
-    run_cmd git -c submodule.recurse=false -c core.quotepath=false checkout --no-recurse-submodules --no-overwrite-ignore -B "$b"
+    run_cmd git -c submodule.recurse=false fetch --no-tags --no-recurse-submodules -- "$REMOTE_NAME" "+refs/heads/${branch}:refs/remotes/${REMOTE_NAME}/${branch}" || return 1
+    run_cmd git -c submodule.recurse=false checkout --no-recurse-submodules --no-overwrite-ignore -b "$branch" --track "${REMOTE_NAME}/${branch}"
   fi
 }
-# 封装 parent_pull_rebase 对应的独立处理逻辑。
+# 父仓只获取一次精确目标，再rebase该已固定引用；网络或冲突失败都阻止后续子仓写入。
 parent_pull_rebase() {
-  local b=""
-  b="$(git rev-parse --abbrev-ref HEAD)"
-
+  local branch="" target_ref=""
+  branch="$(git symbolic-ref --quiet --short HEAD)" || return 1
   if parent_has_uncommitted_changes; then
-    warn_echo "父仓存在未提交变更，已跳过 pull --rebase，避免触发冲突。当前未提交文件如下："
-    git -c core.quotepath=false status --short || true
+    warn_echo "父仓存在未提交变更，已跳过 rebase，保留当前内容。"
+    git -c core.quotepath=false status --short || return 1
     return 0
   fi
-
-  run_cmd git -c submodule.recurse=false fetch --recurse-submodules=no "$REMOTE_NAME" || true
-  if git ls-remote --exit-code --heads "$REMOTE_NAME" "$b" >/dev/null 2>&1; then
-    run_cmd git -c submodule.recurse=false pull --no-recurse-submodules --rebase "$REMOTE_NAME" "$b" || warn_echo "父仓 pull --rebase 未完成，请检查是否存在冲突；本次继续处理子模块"
-  fi
+  target_ref="refs/remotes/${REMOTE_NAME}/${branch}"
+  run_cmd git -c submodule.recurse=false fetch --no-tags --no-recurse-submodules -- "$REMOTE_NAME" "+refs/heads/${branch}:${target_ref}" || return 1
+  run_cmd git -c submodule.recurse=false rebase --no-autostash "$target_ref" || return 1
 }
 # 封装 parent_push_if_needed 对应的独立处理逻辑。
 parent_push_if_needed() {
@@ -1094,44 +1391,6 @@ parent_push_if_needed() {
   run_cmd git push -u "$REMOTE_NAME" "$b"
 }
 # ============================== 分支探测 ==============================
-# 从远端 HEAD 读取默认分支，不创建或改名本地分支。
-remote_default_branch_by_url() {
-  local url="$1"
-  local branch=""
-
-  branch="$(git ls-remote --symref "$url" HEAD 2>/dev/null | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2; exit }' || true)"
-  [[ -n "$branch" ]] && printf '%s\n' "$branch"
-}
-# 封装 remote_branch_exists 对应的独立处理逻辑。
-remote_branch_exists() {
-  local url="$1"
-  local branch="$2"
-  git ls-remote --exit-code --heads "$url" "$branch" >/dev/null 2>&1
-}
-# 严格使用显式分支；缺省才查询远端 HEAD，不能静默切换目标。
-remote_branch_for_url() {
-  local url="$1"
-  local preferred="${2:-}"
-  local branch=""
-
-  if [[ -n "$preferred" ]]; then
-    git check-ref-format "refs/heads/$preferred" >/dev/null 2>&1 &&
-      [[ "$preferred" != -* && "$preferred" != HEAD ]] || return 1
-    remote_branch_exists "$url" "$preferred" || return 1
-    printf '%s\n' "$preferred"
-    return 0
-  fi
-
-  branch="$(remote_default_branch_by_url "$url")"
-  if [[ -n "$branch" ]]; then
-    git check-ref-format "refs/heads/$branch" >/dev/null 2>&1 &&
-      [[ "$branch" != -* && "$branch" != HEAD ]] || return 1
-    printf '%s\n' "$branch"
-    return 0
-  fi
-
-  return 1
-}
 # ============================== 子模块状态判断 ==============================
 # 判断目标是否为可用的 Git 工作区。
 is_git_worktree() {
@@ -1165,12 +1424,147 @@ submodule_risk_echo() {
 }
 # 只列当前仓源码和已暂存内容，忽略同步产生的后代 HEAD 漂移。
 submodule_own_changes() {
-  local submodule_path="$1" dirty="" staged=""
+  local submodule_path="$1" dirty="" staged="" index_flags="" flagged_path="" marker="" marker_path=""
+  for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer BISECT_START index.lock; do
+    marker_path="$(git -C "$submodule_path" rev-parse --git-path "$marker")" || return 1
+    [[ "$marker_path" == /* ]] || marker_path="${submodule_path}/${marker_path}"
+    [[ ! -e "$marker_path" ]] || { error_echo "存在未完成Git操作或锁，先处理再同步：$submodule_path（$marker）"; return 1; }
+  done
+  index_flags="$(git -C "$submodule_path" ls-files -v)" || return 1
+  for flagged_path in "${(@f)index_flags}"; do
+    if [[ "$flagged_path" == [a-z]* || "$flagged_path" == S\ * ]]; then
+      error_echo "索引隐藏了本地源码状态，先处理 assume-unchanged / skip-worktree：${submodule_path}（${flagged_path#? }）"
+      return 1
+    fi
+  done
   dirty="$(git -C "$submodule_path" -c core.quotepath=false status --porcelain --untracked-files=all --ignore-submodules=all)" || return 1
   staged="$(git -C "$submodule_path" -c core.quotepath=false diff --cached --name-status --ignore-submodules=none --)" || return 1
   [[ -z "$dirty" ]] || printf '%s\n' "$dirty"
   [[ -z "$staged" ]] || printf '已暂存（含子模块指针）：\n%s\n' "$staged"
   return 0
+}
+# 在 YES 的 reset 前保护忽略内容和未登记的嵌套仓库；只读检查，不扩大确认范围。
+jobs_download_assert_discard_safe() {
+  emulate -L zsh
+  local repository="${1:A}" temporary="" entry="" tracked_path="" candidate="" ancestor="" found="" collision="" actual_root="" protected_nonbare=0 damaged_root=""
+  local tracked_entries="" nested_entries="" untracked_entries=""
+  local -A inspected_paths inspected_ancestors
+  inspected_paths=()
+  inspected_ancestors=()
+  temporary="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/jobs-discard-check.XXXXXXXX")" || return 1
+  {
+    command git -C "$repository" -c core.hooksPath=/dev/null ls-tree -rz HEAD > "$temporary/tracked" || return 1
+    command git -C "$repository" -c core.hooksPath=/dev/null ls-files --stage -z >> "$temporary/tracked" || return 1
+    # gitlink 本身由子仓保护；只核对 reset 会写入/移除的普通路径。
+    tracked_entries="$(/bin/cat -- "$temporary/tracked")" || return 1
+    for entry in "${(@0)tracked_entries}"; do
+      [[ -n "$entry" ]] || continue
+      [[ "$entry" != 160000\ * ]] || continue
+      tracked_path="${entry#*$'\t'}"
+      [[ -z "${inspected_paths[$tracked_path]:-}" ]] || continue
+      inspected_paths[$tracked_path]=1
+      candidate="${repository}/${tracked_path}"
+      ancestor="${candidate:h}"
+      while [[ "$ancestor" == "${repository}/"* ]]; do
+        [[ -z "${inspected_ancestors[$ancestor]:-}" ]] || break
+        inspected_ancestors[$ancestor]=1
+        if [[ -e "$ancestor/.git" || -L "$ancestor/.git" ||
+              ( -f "$ancestor/HEAD" && -d "$ancestor/objects" && -d "$ancestor/refs" ) ]]; then
+          error_echo "已跟踪路径进入独立嵌套 Git 仓，YES 不授权覆盖：$ancestor"
+          return 1
+        fi
+        ancestor="${ancestor:h}"
+      done
+      # 目标是文件而现场是目录时，hard reset 会移除整棵目录，必须检查深层 Git 边界。
+      if [[ -d "$candidate" && ! -L "$candidate" ]]; then
+        /usr/bin/find "$candidate" \( -name .git -print0 -prune \) -o \( -type d -name objects -print0 -prune \) > "$temporary/nested" || return 1
+        nested_entries="$(/bin/cat -- "$temporary/nested")" || return 1
+        for found in "${(@0)nested_entries}"; do
+          [[ -n "$found" ]] || continue
+          if [[ "${found:t}" == .git ||
+                ( -f "${found:h}/HEAD" && -d "${found:h}/refs" ) ]]; then
+            error_echo "已跟踪文件的恢复会影响嵌套 Git 仓，YES 不授权移除：${found:h}"
+            return 1
+          fi
+        done
+      fi
+    done
+    # clean 的单个 -f 会保留有效 nonbare 仓；bare / 损坏元数据必须显式阻断。
+    command git -C "$repository" -c core.hooksPath=/dev/null ls-files --others --exclude-standard --directory -z > "$temporary/untracked" || return 1
+    untracked_entries="$(/bin/cat -- "$temporary/untracked")" || return 1
+    for tracked_path in "${(@0)untracked_entries}"; do
+      [[ -n "$tracked_path" ]] || continue
+      candidate="${repository}/${tracked_path%/}"
+      [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+      if [[ -e "$candidate/.git" || -L "$candidate/.git" ]]; then
+        actual_root="$(command git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || actual_root=""
+        [[ -z "$actual_root" || "${actual_root:A}" != "${candidate:A}" ]] || continue
+      fi
+      /usr/bin/find "$candidate" \( -name .git -print0 -prune \) -o \( -type d -name objects -print0 -prune \) > "$temporary/nested" || return 1
+      nested_entries="$(/bin/cat -- "$temporary/nested")" || return 1
+      for found in "${(@0)nested_entries}"; do
+        [[ -n "$found" ]] || continue
+        # 上层有效 nonbare 仓会让 clean 保留其整棵子树，内部 bare 仓也在保护内。
+        protected_nonbare=0
+        damaged_root=""
+        ancestor="${found:h}"
+        while [[ "$ancestor" == "${repository}/"* ]]; do
+          if [[ -e "$ancestor/.git" || -L "$ancestor/.git" ]]; then
+            actual_root="$(command git -C "$ancestor" rev-parse --show-toplevel 2>/dev/null)" || actual_root=""
+            if [[ -n "$actual_root" && "${actual_root:A}" == "${ancestor:A}" ]]; then
+              protected_nonbare=1
+              break
+            fi
+            damaged_root="$ancestor"
+          fi
+          ancestor="${ancestor:h}"
+        done
+        (( ! protected_nonbare )) || continue
+        if [[ "${found:t}" == .git || -n "$damaged_root" ||
+              ( -f "${found:h}/HEAD" && -d "${found:h}/refs" ) ]]; then
+          error_echo "待清理目录含独立 Git 仓，YES 不授权移除：${found:h}"
+          return 1
+        fi
+      done
+    done
+    command git -C "$repository" -c core.hooksPath=/dev/null ls-files --others --ignored --exclude-standard --directory -z > "$temporary/ignored" || return 1
+    [[ -s "$temporary/ignored" ]] || return 0
+    command git -C "$repository" -c core.hooksPath=/dev/null ls-tree -rz --name-only HEAD > "$temporary/target" || return 1
+    collision="$(/usr/bin/perl -e '
+      use strict; use warnings; use feature "fc";
+      use Encode qw(decode FB_CROAK);
+      use Unicode::Normalize qw(NFD);
+      sub normalized { my ($value) = @_; return NFD(fc(decode("UTF-8", $value, FB_CROAK))); }
+      my ($ignored_path, $target_path) = @ARGV;
+      my (%ignored, %parents);
+      local $/ = "\0";
+      open my $ignored_fh, "<", $ignored_path or die "Cannot read ignored paths: $!";
+      while (my $item = <$ignored_fh>) {
+        chomp $item; $item =~ s{/$}{};
+        my $key = normalized($item);
+        $ignored{$key} = $item;
+        while ($key =~ s{/[^/]+$}{}) { $parents{$key} //= $item; }
+      }
+      open my $target_fh, "<", $target_path or die "Cannot read target tree: $!";
+      while (my $item = <$target_fh>) {
+        chomp $item;
+        my $key = normalized($item);
+        if (exists $ignored{$key}) { print "$ignored{$key} ↔ $item"; last; }
+        if (exists $parents{$key}) { print "$parents{$key} ↔ $item"; last; }
+        while ($key =~ s{/[^/]+$}{}) {
+          if (exists $ignored{$key}) { print "$ignored{$key} ↔ $item"; exit 0; }
+        }
+      }
+    ' "$temporary/ignored" "$temporary/target")" || return 1
+    if [[ -n "$collision" ]]; then
+      error_echo "忽略内容与 HEAD 恢复路径碰撞，YES 不授权覆盖；请先在外部处理：$collision"
+      return 1
+    fi
+    return 0
+  } always {
+    /bin/rm -f -- "$temporary/tracked" "$temporary/nested" "$temporary/untracked" "$temporary/ignored" "$temporary/target"
+    /bin/rmdir -- "$temporary"
+  }
 }
 # 循环等待当前仓变干净；YES 仅放弃本仓内容，不递归清理后代。
 wait_for_clean_submodule() {
@@ -1195,6 +1589,7 @@ wait_for_clean_submodule() {
       return 1
     fi
     if [[ "$answer" == YES ]]; then
+      jobs_download_assert_discard_safe "$repo_root" || return 1
       run_cmd git -C "$repo_root" -c submodule.recurse=false reset --hard HEAD || return 1
       run_cmd git -C "$repo_root" -c submodule.recurse=false clean -fd -- || return 1
       note_echo "已按 YES 放弃当前仓未提交内容，重新检查：$repo_root"
@@ -1496,23 +1891,6 @@ reconcile_gitmodules_with_config_once() {
   success_echo ".gitmodules 查漏补缺完成"
 }
 # ============================== 子模块目录清理/添加/同步 ==============================
-# 按输入顺序去重目录，避免重复处理目标。
-unique_paths_from_stdin() {
-  local -a result
-  result=()
-  local line=""
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    if ! contains_item "$line" "${result[@]}"; then
-      result+=("$line")
-    fi
-  done
-
-  local p=""
-  for p in "${result[@]}"; do
-    printf '%s\n' "$p"
-  done
-}
 # 按真实 section 定位既有缓存，核验边界、工作区归属和独立引用。
 submodule_cache_for_removal() {
   local submodule_path="$1" section="" parent_git_dir="" modules_root="" cache_dir=""
@@ -1600,34 +1978,34 @@ restore_cached_submodule_worktree() {
     return 1
   }
 }
-# 封装 clone_submodule_worktree 对应的独立处理逻辑。
+# 首次下载先保留完整获取的对象，再从本地缓存检出；失败重跑不清空缓存。
 clone_submodule_worktree() {
   local submodule_path="$1"
   local url="${2:-}" preferred="${3:-}"
   [[ -n "$url" ]] || url="$(clone_url_for_path "$submodule_path")" || return 1
   print_git_source "首次克隆" "$submodule_path" "$PWD" "$url" clone
-  local branch=""
-  branch="$(remote_branch_for_url "$url" "$preferred")" || {
-    error_echo "无法确定或获取目标分支，未克隆：$submodule_path（指定：${preferred:-远端默认}；来源：$(safe_git_source_url "$url")）"
-    return 1
-  }
-
-  local -a clone_args
-  clone_args=()
-
-  if [[ "$SUBMODULE_SHALLOW_CLONE" == "1" ]]; then
-    clone_args+=(--depth "$SUBMODULE_DEPTH" --single-branch)
+  local branch="" cache_repo="" cache_target="" remote_info=""
+  local -a fetch_args
+  fetch_args=(--no-recurse-submodules)
+  [[ "$SUBMODULE_SHALLOW_CLONE" != 1 ]] || fetch_args+=(--depth "$SUBMODULE_DEPTH")
+  if [[ "$SUBMODULE_FETCH_TAGS" == 1 ]]; then
+    fetch_args+=(--tags)
+  else
+    fetch_args+=(--no-tags)
   fi
-
-  if [[ "$SUBMODULE_FETCH_TAGS" != "1" ]]; then
-    clone_args+=(--no-tags)
-  fi
-
   validate_submodule_url_path "$PWD" "$submodule_path" || return 1
-  run_cmd mkdir -p -- "${submodule_path:h}" || return 1
+  if [[ "$DRY_RUN" == 1 ]]; then
+    note_echo "[DRY-RUN] 持久缓存获取目标分支后原子检出：$submodule_path"
+    return 0
+  fi
+  cache_repo="$(jobs_download_cache_repository "$PWD" "${PWD}/${submodule_path}" "$url")" || return 1
+  remote_info="$(jobs_download_remote_branch "$cache_repo" "$url" "$preferred")" || return 1
+  branch="${remote_info%%$'\t'*}"
   info_echo "克隆分支：$branch"
-  run_cmd git -c submodule.recurse=false clone "${clone_args[@]}" --branch "$branch" --no-recurse-submodules -- "$url" "$submodule_path" || return 1
-
+  info_echo "下载缓存（重跑复用已完成对象）：$cache_repo"
+  run_cmd git -C "$cache_repo" -c submodule.recurse=false fetch "${fetch_args[@]}" -- "$url" "+refs/heads/${branch}:refs/heads/${branch}" || return 1
+  cache_target="$(git -C "$cache_repo" rev-parse --verify "refs/heads/${branch}^{commit}")" || return 1
+  jobs_download_checkout_from_cache "$PWD" "$cache_repo" "${PWD}/${submodule_path}" "$url" "$branch" origin "$cache_target" 2>&1 | jobs_download_sanitize_stream | tee -a "$LOG_FILE" || return 1
   run_cmd git -C "$submodule_path" config core.quotepath false || true
   if [[ "$SUBMODULE_FETCH_TAGS" != "1" ]]; then
     run_cmd git -C "$submodule_path" config remote.origin.tagOpt --no-tags || true
@@ -1636,7 +2014,7 @@ clone_submodule_worktree() {
 # 检查当前运行条件是否满足后续流程要求。
 ensure_submodule_worktree_present() {
   local submodule_path="$1"
-  local url="${2:-}" preferred="${3:-}" stage_association="${4:-1}"
+  local url="${2:-}" preferred="${3:-}" stage_association="${4:-1}" initialized_now=0 section=""
   validate_submodule_url_path "$PWD" "$submodule_path" || {
     error_echo "子仓目录不是安全的相对路径，未初始化或覆盖：$submodule_path"
     return 1
@@ -1666,6 +2044,7 @@ ensure_submodule_worktree_present() {
 
   if [[ ! -e "$submodule_path" ]]; then
     clone_submodule_worktree "$submodule_path" "$url" "$preferred" || return 1
+    initialized_now=1
   fi
 
   run_cmd restore_configured_markdown_toc "$submodule_path" 2>&1 | tee -a "$LOG_FILE" || return 1
@@ -1675,6 +2054,9 @@ ensure_submodule_worktree_present() {
     run_cmd git --literal-pathspecs add -- .gitmodules "$submodule_path" || return 1
   fi
 
+  section="$(find_gitmodules_section_by_path "$submodule_path")" || return 1
+  run_cmd git config --local "submodule.${section}.url" "$url" || return 1
+  run_cmd git config --local "submodule.${section}.active" true || return 1
   # 标准子模块形态：子仓目录里保留 .git 单文件，真正 Git 数据放到父仓 .git/modules 下。
   # 这一步不决定是否浅克隆；浅克隆由 --depth 控制。这里负责把 .git 文件夹吸收到父仓管理。
   if [[ ! -f "$submodule_path/.git" ]] && ! run_cmd git --literal-pathspecs submodule absorbgitdirs -- "$submodule_path"; then
@@ -1688,17 +2070,14 @@ ensure_submodule_worktree_present() {
   if [[ "$DRY_RUN" == 1 ]]; then
     note_echo "[DRY-RUN] 已计划登记并归集子模块：$submodule_path"
   elif [[ -f "$submodule_path/.git" ]]; then
+    if (( initialized_now )); then
+      jobs_download_write_marker "$submodule_path" "$url" "$(git -C "$submodule_path" symbolic-ref --quiet --short HEAD)" "$(git -C "$submodule_path" rev-parse HEAD)" || return 1
+    fi
     success_echo "已登记标准子模块 gitlink：$submodule_path（子仓 .git 为单文件）"
   else
     error_echo "子模块元数据未形成标准 .git 指针：$submodule_path；未标记为完成。"
     return 1
   fi
-}
-# 在子仓自身配置作用域中严格解析目标分支。
-resolve_remote_branch_for_submodule() {
-  local submodule_path="$1"
-  local preferred="${2:-}"
-  ( cd "$submodule_path" && remote_branch_for_url origin "$preferred" )
 }
 # 执行对应的环境配置或同步处理。
 sync_one_submodule_to_latest() {
@@ -1718,17 +2097,22 @@ sync_one_submodule_to_latest() {
 
   assert_clean_submodule "$submodule_path" "更新" || return 1
 
+  print_git_source "拉取更新" "$submodule_path" "$PWD/$submodule_path" "$url"
+  local branch="" remote_tip="" remote_info=""
+  remote_info="$(jobs_download_remote_branch "$submodule_path" "$url" "$preferred")" || return 1
+  branch="${remote_info%%$'\t'*}"
+  remote_tip="${remote_info#*$'\t'}"
+  if [[ "$DRY_RUN" != 1 && "$SUBMODULE_FETCH_TAGS" != 1 ]] && jobs_download_marker_matches "$submodule_path" "$url" "$branch" "$remote_tip"; then
+    success_echo "完成标记命中，跳过当前仓下载与同步：$submodule_path（$branch；$remote_tip）"
+    if [[ "$SUBMODULE_RECURSIVE" == 1 ]]; then
+      sync_descendant_submodules_to_latest "$PWD/$submodule_path" "$url" || return 1
+    fi
+    return 0
+  fi
   run_cmd git -C "$submodule_path" config core.quotepath false || true
   run_cmd git -C "$submodule_path" remote set-url origin "$url" || return 1
   if [[ "$SUBMODULE_FETCH_TAGS" != "1" ]]; then
     run_cmd git -C "$submodule_path" config remote.origin.tagOpt --no-tags || true
-  fi
-
-  print_git_source "拉取更新" "$submodule_path" "$PWD/$submodule_path" "$url"
-  local branch=""
-  if ! branch="$(resolve_remote_branch_for_submodule "$submodule_path" "$preferred")"; then
-    error_echo "无法确定远端可同步分支：$submodule_path（指定：${preferred:-远端默认}；来源：$(safe_git_source_url "$url")）"
-    return 1
   fi
 
   local -a fetch_args
@@ -1767,6 +2151,7 @@ sync_one_submodule_to_latest() {
   [[ "$(git -C "$submodule_path" symbolic-ref --quiet --short HEAD)" == "$branch" && "$(git -C "$submodule_path" rev-parse HEAD)" == "$(git -C "$submodule_path" rev-parse "refs/remotes/origin/$branch")" ]] || return 1
 
   run_cmd restore_configured_markdown_toc "$submodule_path" 2>&1 | tee -a "$LOG_FILE" || return 1
+  run_cmd jobs_download_write_marker "$submodule_path" "$url" "$branch" "$(git -C "$submodule_path" rev-parse HEAD)" || return 1
 
   if [[ "$SUBMODULE_RECURSIVE" == 1 ]] && ! sync_descendant_submodules_to_latest "$PWD/$submodule_path" "$url"; then
     error_echo "递归子模块同步失败：$submodule_path；未标记为同步成功。"
@@ -2256,7 +2641,7 @@ show_script_intro_and_wait() {
   print -r -- '递归边界：从运行脚本对应仓库向下，仅处理所选子树，各层读取自己的 .gitmodules；不向上处理。' | jobs_intro_style body
   print -r -- '影响范围：父仓登记和提交指针、子仓代码与分支；默认自动提交父仓，不自动推送。' | jobs_intro_style body
   print -r -- '同步策略：全量按清单逐仓处理；已有子仓复用更新，空目录首次初始化，不删除已有子树或旧仓名目录。' | jobs_intro_style body
-  print -r -- '文档目录：有已配置的目录过滤器才执行本仓 restore / verify；无配置跳过，不自动安装。' | jobs_intro_style body
+  print -r -- '文档目录：已配置过滤器才执行本仓 restore / verify；无配置跳过，不自动安装。' | jobs_intro_style body
   print -r -- '关键风险：分支会对齐远端最新；未提交内容红字加粗标明仓库，循环等待 YES 放弃当前仓改动，或在外部处理后按回车复检。' | jobs_intro_style body
   print -r -- "日志文件：$LOG_FILE" | jobs_intro_style body
   print -r -- '取消方式：按 Ctrl+C 终止；自述确认前不执行真实业务。' | jobs_intro_style body
@@ -2298,12 +2683,53 @@ synchronize_parent_repository() {
 # 创建当前运行的菜单预览文件，并在退出时回收。
 prepare_preview_runtime() {
   PREVIEW_FILE="$(mktemp "${TMPDIR:-/tmp}/${SCRIPT_BASENAME}.preview.XXXXXX")" || return 1
-  trap '[[ -z "${PREVIEW_FILE:-}" ]] || rm -f -- "$PREVIEW_FILE"' EXIT
+}
+# 维护与只拉取共用入口锁；缓存留在锁目录之外，退出只释放本轮锁与预览。
+acquire_download_lock() {
+  DOWNLOAD_LOCK_DIRECTORY="$(git -C "$REPO_ROOT" rev-parse --git-path jobs-readonly-pull.lock)" || return 1
+  [[ "$DOWNLOAD_LOCK_DIRECTORY" == /* ]] || DOWNLOAD_LOCK_DIRECTORY="${REPO_ROOT}/${DOWNLOAD_LOCK_DIRECTORY}"
+  mkdir -- "$DOWNLOAD_LOCK_DIRECTORY" 2>/dev/null || { error_echo "下载任务可能正在运行，请先核实锁：$DOWNLOAD_LOCK_DIRECTORY"; DOWNLOAD_LOCK_DIRECTORY=""; return 1; }
+  DOWNLOAD_LOCK_OWNER_SUBSHELL=$ZSH_SUBSHELL
+}
+# zsh 退出函数必须在脚本层声明，函数内动态注册也会提前释放锁。
+TRAPEXIT() {
+  release_download_runtime
+}
+# 取消后停止业务，由脚本退出函数释放本次资源。
+TRAPINT() {
+  exit 130
+}
+# 终止后保留缓存，释放本次锁。
+TRAPTERM() {
+  exit 143
+}
+# 终端断开时不继续后续业务。
+TRAPHUP() {
+  exit 129
+}
+# 不清理持久下载缓存，也不删除其它进程的 Git 锁。
+release_download_runtime() {
+  (( ZSH_SUBSHELL == DOWNLOAD_LOCK_OWNER_SUBSHELL )) || return 0
+  [[ -z "${PREVIEW_FILE:-}" ]] || rm -f -- "$PREVIEW_FILE"
+  [[ -z "${DOWNLOAD_LOCK_DIRECTORY:-}" ]] || rmdir -- "$DOWNLOAD_LOCK_DIRECTORY"
 }
 # 仅在菜单流程成功结束后输出完成摘要。
 report_completion() {
   success_echo "全部完成 ✅"
   note_echo "日志文件：$LOG_FILE"
+}
+# 维护参数只接受明确值，拼写错误不能静默变成另一种下载或提交策略。
+validate_management_options() {
+  local option_name="" option_value=""
+  for option_name in DRY_RUN FORCE_DELETE AUTO_PARENT_COMMIT AUTO_PARENT_PUSH PRUNE_STALE_GITMODULES SUBMODULE_SHALLOW_CLONE SUBMODULE_FETCH_TAGS SUBMODULE_RECURSIVE; do
+    option_value="${(P)option_name}"
+    [[ "$option_value" == 0 || "$option_value" == 1 ]] || { error_echo "$option_name 只接受 0 或 1。"; return 1; }
+  done
+  [[ "$GIT_URL_STYLE" == auto || "$GIT_URL_STYLE" == https || "$GIT_URL_STYLE" == ssh ]] || { error_echo 'GIT_URL_STYLE 只接受 auto / https / ssh。'; return 1; }
+  if [[ "$SUBMODULE_DEPTH" != <-> || ${#SUBMODULE_DEPTH} -gt 10 ]] || (( 10#$SUBMODULE_DEPTH < 1 || 10#$SUBMODULE_DEPTH > 2147483647 )); then
+    error_echo 'SUBMODULE_DEPTH 必须是 1～2147483647 的十进制整数。'
+    return 1
+  fi
 }
 # 确认后集中初始化环境、路径与日志，函数外不执行真实操作。
 initialize_script_runtime() {
@@ -2319,17 +2745,22 @@ initialize_script_runtime() {
     print -u2 -r -- 'SUBMODULE_RECURSIVE 只支持 0（仅直属一层）或 1（向下递归）。'
     return 1
   fi
-  : > "$LOG_FILE"
+  umask 077
+  LOG_FILE="$(mktemp "${LOG_FILE}.XXXXXXXX")" || return 1
+  print -r -- "本次日志：$LOG_FILE"
+  jobs_download_validate_settings || return 1
+  validate_management_options || return 1
 }
 # 编排脚本的高层业务流程。
 run_management_download() {
-  show_script_intro_and_wait # 首先展示维护模式内置自述，确认失败立即停止。
-  initialize_script_runtime # 确认后初始化 Shell、入口路径和本轮日志。
-  prepare_parent_repository # 验证父仓根目录，载入本仓清单并准备下载线路。
-  ensure_fzf_healthy # 复用可用菜单工具，缺失时才处理依赖。
-  prepare_preview_runtime # 准备菜单预览及退出清理。
-  main_menu_loop "$PREVIEW_FILE" # 根据菜单选择同步，失败立即向入口传播。
-  report_completion # 成功后汇总结果与日志位置。
+  show_script_intro_and_wait || return $? # 首先展示维护模式内置自述，确认失败立即停止。
+  initialize_script_runtime || return $? # 确认后初始化 Shell、入口路径和本轮日志。
+  prepare_parent_repository || return $? # 验证父仓根目录，载入本仓清单并准备下载线路。
+  acquire_download_lock || return $? # 两种模式共用入口锁，避免同时改写缓存与子仓。
+  ensure_fzf_healthy || return $? # 复用可用菜单工具，缺失时才处理依赖。
+  prepare_preview_runtime || return $? # 准备菜单预览及退出清理。
+  main_menu_loop "$PREVIEW_FILE" || return $? # 根据菜单选择同步，失败立即向入口传播。
+  report_completion || return $? # 成功后汇总结果与日志位置。
 }
 # 先选择用途，默认只拉取在维护依赖和父仓写操作之前分流。
 select_download_operation_mode() {
@@ -2337,7 +2768,9 @@ select_download_operation_mode() {
   local selected="" picker_result=0 mode_cursor=1
   [[ "${DOWNLOAD_OPERATION_MODE:-readonly}" == maintenance ]] && mode_cursor=2
   print -r -- '================ Git 子模块下载与同步 ================' | jobs_intro_style title
-  print -r -- '同步策略版本：2026.10.25-fzf-navigation（选择支持逐层返回，子仓继续跟随分支最新）' | jobs_intro_style body
+  print -r -- '同步策略版本：2026.10.27-audited（单文件共享实现、失败恢复与逐仓完成标记）' | jobs_intro_style body
+  print -r -- '下载保护：已完整获取的对象跨运行保留；默认单次最多900秒、网络失败最多3次，可通过 JOBS_DOWNLOAD_* 调整。' | jobs_intro_style body
+  print -r -- '进度标记：每次先查远端，完成标记匹配来源、分支、提交和本地状态才跳过当前仓，继续检查后代。' | jobs_intro_style body
   print -r -- '同步策略：只拉取跟随各层目标分支最新；维护模式保留本仓清单及原提交开关。' | jobs_intro_style body
   print -r -- "目标父仓：$REPO_ROOT" | jobs_intro_style body
   print -r -- '只拉取不暂存、不提交、不推送；维护模式会登记子仓，沿用 AUTO_PARENT_*。危险舍弃另需 YES。' | jobs_intro_style body
@@ -2362,16 +2795,27 @@ select_download_operation_mode() {
     *) print -u2 -r -- '用途选择无效，未执行同步。'; return 1 ;;
   esac
 }
-# 执行内嵌的安全只拉取实现，保留终端输入且不依赖外置脚本。
-run_embedded_readonly_pull() {
-  local engine_code=""
-  engine_code="$(/bin/cat <<'JOBS_READONLY_PULL_ENGINE'
+# 只导出明确列出的共享函数；两种模式共用同一实现，子进程不继承维护菜单或Git转调。
+render_readonly_pull_engine() {
+  local function_name=""
+  local -a shared_functions
+  shared_functions=(
+    jobs_download_validate_settings jobs_download_git jobs_download_remote_branch jobs_download_remote_tip
+    jobs_download_marker_signature jobs_download_marker_matches jobs_download_write_marker
+    jobs_download_cache_repository jobs_download_checkout_from_cache restore_configured_markdown_toc
+  )
+  for function_name in "${shared_functions[@]}"; do
+    (( ${+functions[$function_name]} )) || { print -u2 -r -- "缺少内置共享函数：$function_name"; return 1; }
+    functions "$function_name" || return 1
+  done
+  /bin/cat <<'JOBS_READONLY_PULL_ENGINE'
 #!/bin/zsh
 # 脚本自述：
 # - 脚本名称：【MacOS@SourceTree】⏬只拉取远程代码.command
 # - 核心用途：将当前仓库同步到明确的远程上游，逐层检出子模块目标分支的远端最新提交，不提交、不推送。
 # - 影响范围：先 fetch；发现本地改动、未跟踪文件或独有提交时，终端红字列明范围，精确输入 YES 才舍弃。
 # - 保护边界：忽略文件保留；游离入口先预检再恢复跟踪分支，独有历史、上游不明确、子仓风险或忽略文件覆盖风险时停止。
+# - 下载保护：首次子仓使用持久对象缓存；传输限时与网络重试不保证半截 pack 按字节续传。
 # - 运行提示：SourceTree 只打开 Terminal.app；终端先回车确认，危险操作另需 YES，Ctrl+C 取消。
 
 RAW_SCRIPT_PATH="$0"
@@ -2417,6 +2861,7 @@ PLAN_OLD_PINS=()
 PLAN_BRANCHES=()
 PLAN_REMOTES=()
 PLAN_LOCAL_HEADS=()
+PLAN_SKIP_SYNC=()
 LOCK_DIRECTORY=""
 LOCK_HELD=0
 COLOR_RED=""
@@ -2476,8 +2921,10 @@ show_script_intro_and_wait() {
   print -r -- "${COLOR_BLUE}2、先获取远程；本地改动、未跟踪文件和独有提交须精确输入 YES 才舍弃。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}3、子模块按 .gitmodules 分支（缺省为远端默认分支）更新并保持分支态；子仓源码、暂存指针、分叉和独有游离提交均停止。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}游离入口：先确定分支并获取远端，检查历史与工作区后才恢复本地跟踪分支；独有历史或脏源码停止。${COLOR_RESET}"
-  print -r -- "${COLOR_BLUE}4、已配置目录过滤器的仓库执行本仓 restore / verify；无配置跳过，不自动安装。${COLOR_RESET}"
+  print -r -- "${COLOR_BLUE}4、已配置目录过滤器才执行本仓 restore / verify；无配置跳过，不自动安装。${COLOR_RESET}"
   print -r -- "${COLOR_BLUE}5、SourceTree 打开独立终端；回车继续，Ctrl+C 取消；日志：${LOG_FILE}${COLOR_RESET}"
+  print -r -- "${COLOR_BLUE}6、首次下载缓存跨运行保留；默认单次传输最多900秒、网络失败最多3次，JOBS_DOWNLOAD_* 可调整；未完成的 pack 可能重下。${COLOR_RESET}"
+  print -r -- "${COLOR_BLUE}7、先查远端最新提交；完成标记与本地状态匹配才跳过当前仓下载 / 检出，后代仍独立检查。${COLOR_RESET}"
   if (( IS_SOURCETREE_RUNTIME )); then
     open_terminal_for_repository "$@"
     exit $?
@@ -2516,9 +2963,11 @@ initialize_runtime() {
   setopt NO_NOMATCH PIPE_FAIL
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
   umask 077
-  : > "$LOG_FILE" || { print -u2 -r -- "无法创建日志：${LOG_FILE}"; exit 1; }
+  LOG_FILE="$(mktemp "${LOG_FILE}.XXXXXXXX")" || { print -u2 -r -- "无法创建私有日志：${LOG_FILE}"; exit 1; }
+  print -r -- "本次日志：$LOG_FILE"
   configure_output_mode
   configure_gitee_https_transport
+  jobs_download_validate_settings || fail '下载超时 / 重试参数无效。'
 }
 # 兼容旧根仓 / 子仓的 Gitee 标准 SSH 地址；只追加本次进程配置，保留既有 Git 环境规则。
 configure_gitee_https_transport() {
@@ -2554,66 +3003,13 @@ fail() {
   log_message info "日志：${LOG_FILE}"
   exit 1
 }
-# 只还原已配置的目录过滤器；无配置不安装，保留当前正文与暂存内容。
-restore_configured_markdown_toc() {
-  local toc_root="${1:A}" toc_smudge="" toc_process="" toc_node="" toc_result=0
-  toc_smudge="$(command git -C "$toc_root" config --get filter.jobs-markdown-toc.smudge)" || toc_result=$?
-  if (( toc_result > 1 )); then
-    print -u2 -r -- "无法读取 Markdown 目录过滤器，保留现场：${toc_root}"
-    return 1
-  fi
-  toc_result=0
-  toc_process="$(command git -C "$toc_root" config --get filter.jobs-markdown-toc.process)" || toc_result=$?
-  if (( toc_result > 1 )) || [[ -n "$toc_process" ]]; then
-    print -u2 -r -- "Markdown 目录 process 配置冲突或读取失败，保留现场：${toc_root}"
-    return 1
-  fi
-  if [[ -z "$toc_smudge" ]]; then
-    print -r -- "Markdown 目录：未配置还原过滤器，跳过：${toc_root}"
-    return 0
-  fi
-  # 还原不跨越未完成的合并、冲突或其它 Git 写操作。
-  local toc_marker="" toc_marker_path="" toc_unmerged=""
-  for toc_marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer BISECT_START index.lock; do
-    toc_marker_path="$(command git -C "$toc_root" rev-parse --git-path "$toc_marker")" || return 1
-    [[ "$toc_marker_path" == /* ]] || toc_marker_path="${toc_root}/${toc_marker_path}"
-    if [[ -e "$toc_marker_path" ]]; then
-      print -u2 -r -- "存在未完成 Git 操作或锁，未还原目录：${toc_root}（${toc_marker}）"
-      return 1
-    fi
-  done
-  toc_unmerged="$(command git -C "$toc_root" ls-files --unmerged)" || return 1
-  if [[ -n "$toc_unmerged" ]]; then
-    print -u2 -r -- "索引存在未解决冲突，未还原目录：${toc_root}"
-    return 1
-  fi
-  local toc_tool="${toc_root}/.jobs-markdown-toc/MarkdownToc.mjs"
-  if [[ ! -f "$toc_tool" || -L "$toc_tool" || -L "${toc_tool:h}" ]]; then
-    print -u2 -r -- "已配置 Markdown 目录过滤器，但缺少本仓安全还原工具，停止：${toc_tool}"
-    return 1
-  fi
-  # 优先使用过滤器已登记的 Node 路径，不求值或执行配置中的 Shell 文本。
-  local -a toc_words
-  toc_words=(${(z)toc_smudge})
-  toc_node="${(Q)toc_words[1]}"
-  if [[ "$toc_node" != /* || "${toc_node:t}" != node || ! -x "$toc_node" ]]; then
-    toc_node="$(command -v node 2>/dev/null)" || toc_node=""
-  fi
-  if [[ -z "$toc_node" || ! -x "$toc_node" ]]; then
-    print -u2 -r -- "已配置 Markdown 目录过滤器，但 Node.js 不可用；未安装或改写配置：${toc_root}"
-    return 1
-  fi
-  print -r -- "Markdown 目录：执行已配置过滤器的本仓还原与检查：${toc_root}"
-  "$toc_node" "$toc_tool" restore || return 1
-  "$toc_node" "$toc_tool" verify
-}
 # 把入口仓恢复日志纳入当前只拉取日志，失败交给主流程停止。
 restore_entry_markdown_toc() {
   restore_configured_markdown_toc "$REPOSITORY" 2>&1 | sanitize_stream | /usr/bin/tee -a "$LOG_FILE" || fail '入口仓 Markdown 目录还原失败。'
 }
 # 所有 Git 操作禁用递归和本地钩子，避免一次拉取扩展业务范围。
 repo_git() {
-  command git -C "$REPOSITORY" -c color.ui=false -c core.hooksPath=/dev/null -c submodule.recurse=false "$@"
+  jobs_download_git -C "$REPOSITORY" -c color.ui=false -c core.hooksPath=/dev/null -c submodule.recurse=false "$@"
 }
 # 外部 Git 输出脱敏落盘，并保留管道失败状态。
 run_git() {
@@ -2814,8 +3210,15 @@ fetch_target() {
   log_message info "配置来源：${SOURCE_URL}"
   log_message info "拉取地址（本地 Git 配置展开）：${EFFECTIVE_URL}"
   log_message info "目标位置：${REPOSITORY}"
-  run_git fetch --no-tags --no-recurse-submodules -- "$REMOTE" "+${MERGE_REF}:${TRACKING_REF}" || fail '远程获取失败，未舍弃本地内容。'
-  TARGET_HEAD="$(repo_git rev-parse --verify "${TRACKING_REF}^{commit}")" || fail '远程目标不是有效提交。'
+  local advertised_tip=""
+  advertised_tip="$(jobs_download_remote_tip "$REPOSITORY" "$REMOTE" "${MERGE_REF#refs/heads/}")" || fail '远端最新提交查询失败，不能沿用旧标记。'
+  if jobs_download_marker_matches "$REPOSITORY" "$SOURCE_URL" "$BRANCH" "$advertised_tip"; then
+    TARGET_HEAD="$advertised_tip"
+    log_message success "完成标记命中，跳过当前仓下载与同步：${REPOSITORY}（${BRANCH}；${TARGET_HEAD}）"
+  else
+    run_git fetch --no-tags --no-recurse-submodules -- "$REMOTE" "+${MERGE_REF}:${TRACKING_REF}" || fail '远程获取失败，未舍弃本地内容。'
+    TARGET_HEAD="$(repo_git rev-parse --verify "${TRACKING_REF}^{commit}")" || fail '远程目标不是有效提交。'
+  fi
   log_message info "本次固定目标：${TARGET_HEAD}"
   assert_detached_entry_history_safe
 }
@@ -2856,7 +3259,7 @@ assert_tracked_paths_have_no_nested_git() {
 tree_git() {
   local tree_repository="$1"
   shift
-  command git -C "$tree_repository" -c color.ui=false -c core.hooksPath=/dev/null -c submodule.recurse=false "$@"
+  jobs_download_git -C "$tree_repository" -c color.ui=false -c core.hooksPath=/dev/null -c submodule.recurse=false "$@"
 }
 # 保留 Git 失败状态，所有子仓传输输出同样脱敏。
 run_tree_git() {
@@ -2966,13 +3369,13 @@ show_child_source() {
   log_message info "解析来源：${source_url}"
   log_message info "拉取地址（本地 Git 配置展开）：${effective_url}"
 }
-# 预取目标分支最新提交并固定本次 SHA；只在临时裸仓准备首次克隆，不强制改写本地分支。
+# 预取目标分支并固定 SHA；首次对象库跨运行保留，临时目录仅存本轮预检清单。
 prepare_child_commit() {
   local child_root="$1" source_url="$2" requested_branch="$3" parent_branch="$4" plan_number="$5"
   local object_repo="$child_root" branch="$requested_branch" remote_name=origin remote_listing="" current_branch="" local_head="" advertised=""
   if [[ ! -e "${child_root}/.git" ]]; then
-    object_repo="${PREPARE_DIRECTORY}/objects-${plan_number}.git"
-    run_tree_git "$PREPARE_DIRECTORY" init --bare --quiet "$object_repo" || fail "无法建立子模块临时对象库：${child_root}"
+    object_repo="$(jobs_download_cache_repository "$REPOSITORY" "$child_root" "$source_url")" || fail "无法准备子模块持久对象库：${child_root}"
+    log_message info "下载缓存（重跑复用已完成对象）：${object_repo}"
   else
     remote_listing="$(tree_git "$child_root" remote)" || fail "无法读取子仓远端：${child_root}"
     current_branch="$(tree_git "$child_root" symbolic-ref --quiet --short HEAD 2>/dev/null)" || current_branch=""
@@ -2981,11 +3384,8 @@ prepare_child_commit() {
     branch="$parent_branch"
   fi
   show_child_source "$child_root" "$source_url" "$branch" "$object_repo"
-  if [[ -z "$branch" ]]; then
-    advertised="$(tree_git "$object_repo" ls-remote --symref -- "$source_url" HEAD)" || fail "无法查询子仓默认分支：${child_root}"
-    branch="$(print -r -- "$advertised" | /usr/bin/awk '$1 == "ref:" && $2 ~ /^refs\/heads\// { sub(/^refs\/heads\//, "", $2); print $2; exit }')"
-    [[ -n "$branch" ]] || fail "远端 HEAD 未指向明确分支：${child_root}；请在 .gitmodules 指定 branch。"
-  fi
+  advertised="$(jobs_download_remote_branch "$object_repo" "$source_url" "$branch")" || fail "无法确定子仓目标分支与最新提交：${child_root}"
+  branch="${advertised%%$'\t'*}"
   tree_git "$object_repo" check-ref-format "refs/heads/${branch}" || fail "子仓目标分支无效：${child_root}（${branch}）"
   [[ "$branch" != -* && "$branch" != HEAD ]] || fail "子仓目标必须是普通分支：${child_root}（${branch}）"
   if [[ "$object_repo" == "$child_root" ]]; then
@@ -3005,11 +3405,21 @@ prepare_child_commit() {
     tree_git "$child_root" config --get "remote.${remote_name}.url" >/dev/null || fail "子仓目标分支远端不存在：${child_root}（${remote_name}）"
   fi
   log_message info "拉取分支：${child_root} → ${remote_name}/${branch}"
+  local advertised_tip="" skip_sync=0
+  advertised_tip="${advertised#*$'\t'}"
+  if [[ "$object_repo" == "$child_root" ]] && jobs_download_marker_matches "$child_root" "$source_url" "$branch" "$advertised_tip"; then
+    skip_sync=1
+    log_message success "完成标记命中，跳过当前仓下载与同步：${child_root}（${branch}；${advertised_tip}）"
+  fi
   local -a fetch_options
   fetch_options=(--no-tags --no-recurse-submodules)
   [[ "$object_repo" != "$child_root" ]] && fetch_options+=(--depth=1)
-  run_tree_git "$object_repo" fetch "${fetch_options[@]}" -- "$source_url" "+refs/heads/${branch}:refs/remotes/${remote_name}/${branch}" || fail "子仓分支获取失败：${child_root}（${branch}；来源：${source_url}）"
-  PLAN_TARGETS[$plan_number]="$(tree_git "$object_repo" rev-parse --verify "refs/remotes/${remote_name}/${branch}^{commit}")" || fail "无法确定子仓最新提交：${child_root}"
+  if (( skip_sync )); then
+    PLAN_TARGETS[$plan_number]="$advertised_tip"
+  else
+    run_tree_git "$object_repo" fetch "${fetch_options[@]}" -- "$source_url" "+refs/heads/${branch}:refs/remotes/${remote_name}/${branch}" || fail "子仓分支获取失败：${child_root}（${branch}；来源：${source_url}）"
+    PLAN_TARGETS[$plan_number]="$(tree_git "$object_repo" rev-parse --verify "refs/remotes/${remote_name}/${branch}^{commit}")" || fail "无法确定子仓最新提交：${child_root}"
+  fi
   if [[ "$object_repo" == "$child_root" ]]; then
     local_head="$(tree_git "$child_root" rev-parse --verify "refs/heads/${branch}^{commit}" 2>/dev/null)" || local_head=""
     if [[ -n "$local_head" ]]; then
@@ -3022,6 +3432,7 @@ prepare_child_commit() {
   PLAN_BRANCHES[$plan_number]="$branch"
   PLAN_REMOTES[$plan_number]="$remote_name"
   PLAN_LOCAL_HEADS[$plan_number]="$local_head"
+  PLAN_SKIP_SYNC[$plan_number]="$skip_sync"
 }
 # 删除、改名和子模块 / 普通路径互换会产生有损现场，本动作只接受保留路径和正常新增。
 assert_gitlink_paths_preserved() {
@@ -3107,6 +3518,7 @@ prepare_descendant_plan() {
     PLAN_BRANCHES+=("")
     PLAN_REMOTES+=("")
     PLAN_LOCAL_HEADS+=("")
+    PLAN_SKIP_SYNC+=(0)
     plan_number=${#PLAN_PATHS}
     requested_branch="$(tree_git "$object_repo" config --file "$manifest" --get-all "submodule.${section}.branch" 2>/dev/null)" || requested_branch=""
     [[ "$requested_branch" != *$'\n'* ]] || fail "子模块分支配置不唯一：${child_root}"
@@ -3115,6 +3527,14 @@ prepare_descendant_plan() {
     if [[ -n "$child_head" ]]; then
       assert_child_head_is_preserved "$child_root" "$old_pin" "$child_pin"
       assert_child_worktree_ready "$child_root" "$child_pin"
+      # 已检出的当前仓已经完成时立即记账，后面其它仓失败也能保留这一进度。
+      if [[ "$child_head" == "$child_pin" && "$child_branch" == "refs/heads/${PLAN_BRANCHES[$plan_number]}" &&
+            "$(tree_git "$child_root" config --get-all "remote.${PLAN_REMOTES[$plan_number]}.url")" == "$child_url" &&
+            "$(tree_git "$child_root" rev-parse --symbolic-full-name "${PLAN_BRANCHES[$plan_number]}@{upstream}" 2>/dev/null)" == "refs/remotes/${PLAN_REMOTES[$plan_number]}/${PLAN_BRANCHES[$plan_number]}" ]] &&
+         jobs_download_marker_signature "$child_root" "$child_url" "${PLAN_BRANCHES[$plan_number]}" "$child_pin" >/dev/null 2>&1; then
+        jobs_download_write_marker "$child_root" "$child_url" "${PLAN_BRANCHES[$plan_number]}" "$child_pin" || fail "子仓完成标记写入失败：${child_root}"
+        PLAN_SKIP_SYNC[$plan_number]=1
+      fi
     fi
     prepare_descendant_plan "$child_root" "${PLAN_OBJECT_REPOS[$plan_number]}" "$child_pin" "$child_url" "$((depth + 1))" "$child_head" "${PLAN_BRANCHES[$plan_number]}"
   done < "$tree_listing"
@@ -3159,7 +3579,10 @@ synchronize_submodule_plan() {
     target_pin="${PLAN_TARGETS[$index]}"
     branch="${PLAN_BRANCHES[$index]}"
     remote_name="${PLAN_REMOTES[$index]}"
-    if [[ -n "${PLAN_ORIGINAL_HEADS[$index]}" ]]; then
+    if [[ "${PLAN_SKIP_SYNC[$index]}" == 1 ]]; then
+      assert_child_worktree_ready "$child_root" "$target_pin"
+      jobs_download_marker_matches "$child_root" "${PLAN_URLS[$index]}" "$branch" "$target_pin" || fail "确认后子仓完成状态变化，请重新运行：${child_root}"
+    elif [[ -n "${PLAN_ORIGINAL_HEADS[$index]}" ]]; then
       [[ "$(tree_git "$child_root" rev-parse HEAD)" == "${PLAN_ORIGINAL_HEADS[$index]}" ]] || fail "检出前子仓 HEAD 已变化：${child_root}"
       current_branch="$(tree_git "$child_root" symbolic-ref --quiet HEAD 2>/dev/null)" || current_branch=""
       [[ "$current_branch" == "${PLAN_ORIGINAL_BRANCHES[$index]}" ]] || fail "检出前子仓分支已变化：${child_root}"
@@ -3174,13 +3597,9 @@ synchronize_submodule_plan() {
     else
       assert_new_submodule_path_empty "$child_root"
       log_message info "首次克隆已预检分支：${child_root} → ${branch}；来源：${PLAN_URLS[$index]}"
-      # 先复制已预检对象但不写工作树，登记真实远端后才让条件过滤器参与首次检出。
-      run_tree_git "$parent_root" clone --no-checkout --no-local --single-branch --branch "$branch" --origin "$remote_name" --no-recurse-submodules -- "${PLAN_OBJECT_REPOS[$index]}" "$child_root" || fail "子模块分支克隆失败：${child_root}"
+      jobs_download_checkout_from_cache "$parent_root" "${PLAN_OBJECT_REPOS[$index]}" "$child_root" "${PLAN_URLS[$index]}" "$branch" "$remote_name" "$target_pin" 2>&1 | sanitize_stream | /usr/bin/tee -a "$LOG_FILE" || fail "子模块首次暂存检出失败：${child_root}；下载缓存已保留。"
     fi
     run_tree_git "$child_root" remote set-url "$remote_name" "${PLAN_URLS[$index]}" || fail "无法记录子仓下载来源：${child_root}"
-    if [[ -z "${PLAN_ORIGINAL_HEADS[$index]}" ]]; then
-      run_tree_git "$child_root" checkout --no-recurse-submodules --no-overwrite-ignore "$branch" || fail "子仓首次检出失败：${child_root}"
-    fi
     # 保留已有宽映射和其它分支；仅在目标缺少有效上游映射时补一条精确 refspec。
     if [[ "$(tree_git "$child_root" -c "branch.${branch}.remote=${remote_name}" -c "branch.${branch}.merge=refs/heads/${branch}" rev-parse --symbolic-full-name "${branch}@{upstream}" 2>/dev/null)" != "refs/remotes/${remote_name}/${branch}" ]]; then
       run_tree_git "$child_root" config --local --add "remote.${remote_name}.fetch" "+refs/heads/${branch}:refs/remotes/${remote_name}/${branch}" || fail "无法配置子仓分支映射：${child_root}"
@@ -3192,6 +3611,7 @@ synchronize_submodule_plan() {
     run_tree_git "$parent_root" --literal-pathspecs submodule absorbgitdirs -- "$child_path" || fail "无法归集子模块元数据：${child_root}"
     [[ "$(tree_git "$child_root" symbolic-ref --quiet --short HEAD)" == "$branch" && "$(tree_git "$child_root" rev-parse HEAD)" == "$target_pin" ]] || fail "子模块分支或最新提交核验失败：${child_root}"
     restore_configured_markdown_toc "$child_root" 2>&1 | sanitize_stream | /usr/bin/tee -a "$LOG_FILE" || fail "子仓 Markdown 目录还原失败：${child_root}"
+    jobs_download_write_marker "$child_root" "${PLAN_URLS[$index]}" "$branch" "$target_pin" || fail "子仓完成标记写入失败：${child_root}"
     log_message success "✔ 子模块已同步分支最新：${child_root} → ${remote_name}/${branch}（${target_pin}）；来源：${PLAN_URLS[$index]}"
   done
 }
@@ -3311,6 +3731,7 @@ synchronize_repository() {
   restore_entry_markdown_toc
   synchronize_submodule_plan
   [[ -z "$(repo_git status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]] || fail '同步后仍有本地变化，未标记成功。'
+  jobs_download_write_marker "$REPOSITORY" "$SOURCE_URL" "$BRANCH" "$TARGET_HEAD" || fail '入口仓完成标记写入失败。'
   log_message success "✔ 已同步：${BRANCH} → ${TARGET_HEAD}"
   log_message success "来源：${EFFECTIVE_URL}；${#PLAN_PATHS} 个子模块已按目标分支最新提交核验；gitlink 漂移保留在工作区；未执行提交或推送。"
   log_message info "日志：${LOG_FILE}"
@@ -3321,7 +3742,7 @@ main() {
   initialize_runtime # 确认后建立私有日志与退出清理。
   resolve_repository "$@" # 校验目标并防止同一动作并行运行。
   assert_repository_ready # 未完成 Git 操作和隐藏状态先停止。
-  restore_entry_markdown_toc # 已配置才还原当前文档，无配置不安装。
+  restore_entry_markdown_toc # 仅沿用已有配置，不在拉取前安装全局驱动。
   resolve_upstream # 仅使用当前分支明确配置的远程上游。
   fetch_target # 成功获取并固定提交后才考虑舍弃。
   assert_nested_repositories_safe # 预检各层最新分支，保护子仓和嵌套仓库。
@@ -3333,7 +3754,11 @@ main() {
 
 main "$@"
 JOBS_READONLY_PULL_ENGINE
-)" || return 1
+}
+# 执行内嵌的安全只拉取实现，保留终端输入且不依赖外置脚本。
+run_embedded_readonly_pull() {
+  local engine_code=""
+  engine_code="$(render_readonly_pull_engine)" || return 1
   /bin/zsh -c "$engine_code" "$SCRIPT_FILE" --terminal-run "$REPO_ROOT"
 }
 # 模式分流在 Homebrew、清单登记和父仓拉取之前完成。
@@ -3350,7 +3775,7 @@ run_selected_download_mode() {
     *) return 1 ;;
   esac
 }
-# 先选择只拉取或维护，再执行各自独立的确认与业务流程。
+# 先完成所选拉取业务，再单独询问附加配置。
 run_download_selection_loop() {
   setopt LOCAL_OPTIONS
   unsetopt ERR_EXIT
@@ -3359,7 +3784,11 @@ run_download_selection_loop() {
     select_download_operation_mode || return $?
     pull_result=0
     # 独立执行以保留业务失败即停，返回 20 仅表示回到用途选择。
-    ( set -e; run_selected_download_mode "$@" )
+    (
+      trap 'release_download_runtime' EXIT ZERR
+      set -e
+      run_selected_download_mode "$@"
+    )
     pull_result=$?
     if (( pull_result == 20 )); then
       continue
